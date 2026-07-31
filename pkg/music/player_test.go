@@ -65,6 +65,59 @@ func TestPlayerRepeatOneReplaysCurrentOnIdle(t *testing.T) {
 	}
 }
 
+// TestOnPlayingStatusIgnoresEarlyIdleAsManualPause 覆盖真实遇到的 bug：设备物理暂停/停止键
+// 按下后，mute_stat 上报的不是 "Paused" 而是直接变成 "Idle"，从我们的角度跟"这首歌自然
+// 播完了"完全没法区分。结果是用户按物理暂停键，却被我们当成"播完了"自动切到下一首——
+// 物理暂停键形同虚设。用已经解析出的真实时长做兜底：只播放了一小部分就 Idle，
+// 判定为手动打断，不应该自动切下一首。
+func TestOnPlayingStatusIgnoresEarlyIdleAsManualPause(t *testing.T) {
+	p, played := newTestPlayer(t)
+	items := []SongItem{
+		{Path: "a.mp3", URL: "http://music/a.mp3", DurationMs: 120_000}, // 真实时长 2 分钟
+		{Path: "b.mp3", URL: "http://music/b.mp3", DurationMs: 120_000},
+	}
+	p.SetQueue(items)
+	if len(*played) != 1 {
+		t.Fatalf("expected first song to start, played=%v", *played)
+	}
+
+	// 模拟"只播了 10 秒（远小于 2 分钟真实时长的 70%）就收到 Idle"——典型的物理暂停/停止键场景。
+	p.mu.Lock()
+	p.lastPlayURLAt = time.Now().Add(-10 * time.Second)
+	p.mu.Unlock()
+	p.OnPlayingStatus("Playing")
+	p.OnPlayingStatus("Idle")
+
+	if len(*played) != 1 {
+		t.Fatalf("expected no auto-advance on early idle (manual pause), played=%v", *played)
+	}
+	if p.CurrentState() != StateIdle {
+		t.Fatalf("expected state to become idle after manual pause, got %d", p.CurrentState())
+	}
+}
+
+// TestOnPlayingStatusStillAdvancesOnGenuineCompletion 确认这个兜底不会误伤正常的
+// "歌曲真的播完了"场景：距上次 PlayURL 的时间已经接近/超过真实时长时，应该照常自动切歌。
+func TestOnPlayingStatusStillAdvancesOnGenuineCompletion(t *testing.T) {
+	p, played := newTestPlayer(t)
+	items := []SongItem{
+		{Path: "a.mp3", URL: "http://music/a.mp3", DurationMs: 120_000}, // 真实时长 2 分钟
+		{Path: "b.mp3", URL: "http://music/b.mp3", DurationMs: 120_000},
+	}
+	p.SetQueue(items)
+
+	// 模拟"播了 1 分 55 秒（已经超过 2 分钟的 70%）才收到 Idle"——正常播完的场景。
+	p.mu.Lock()
+	p.lastPlayURLAt = time.Now().Add(-115 * time.Second)
+	p.mu.Unlock()
+	p.OnPlayingStatus("Playing")
+	p.OnPlayingStatus("Idle")
+
+	if len(*played) != 2 {
+		t.Fatalf("expected genuine completion to advance to next song, played=%v", *played)
+	}
+}
+
 func TestPlayerRepeatOneManualNextStillAdvances(t *testing.T) {
 	// 单曲循环只影响自动 Idle，用户手动 "下一首" 仍然要跳出当前曲，
 	// 跟 iTunes / Spotify / Apple Music 一致。

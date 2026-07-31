@@ -89,6 +89,13 @@ const (
 	// Speak 返回后再延一段时间继续抑制：mphelper play 把 mediaplayer 恢复 Playing 需要时间，
 	// 这期间收到的 Idle 仍可能是恢复过程中的瞬态。
 	speakSuppressTail = 3 * time.Second
+
+	// earlyIdleThresholdRatio 用于区分"歌曲自然播完"和"用户手动暂停/停止"（比如按了设备
+	// 物理暂停键）：如果距上次 PlayURL 的时间占这首歌真实时长的比例低于这个值，判定为
+	// 手动打断，不自动切下一首。0.7 留了比较大的容错空间（应对 CBR 估算误差、VBR 文件等），
+	// 同时足以覆盖"物理暂停键按下时track 通常远没播完"这种典型场景。
+	// 只对能解析出真实时长的 .mp3 生效（IndexedSong.DurationMs>0）。
+	earlyIdleThresholdRatio = 0.7
 )
 
 // SongItem 队列中的歌曲项
@@ -555,6 +562,23 @@ func (p *Player) OnPlayingStatus(status string) {
 					since.Round(time.Millisecond), playGracePeriod)
 				// 注意：state 保持 Playing，让后续真正稳定的状态决定走向
 				return
+			}
+			// 真实遇到的 bug：设备物理暂停/停止键按下后，mute_stat 上报的不是 "Paused"(2)
+			// 而是直接变成 "Idle"（跟"这首歌自然播完了"从 mute_stat 的角度完全无法区分）。
+			// 结果就是用户按物理暂停键，我们却当成"播完了"自动切到下一首——物理暂停键
+			// 形同虚设。用已经解析出的真实时长（IndexedSong.DurationMs）做个兜底判断：
+			// 如果距上次 PlayURL 的时间远小于这首歌真实应该播放的时长，大概率不是"自然播完"，
+			// 而是用户手动打断了播放，这种情况下不应该自动切下一首，老老实实停在这里。
+			if p.currentSong.DurationMs > 0 {
+				expected := time.Duration(p.currentSong.DurationMs) * time.Millisecond
+				since := now.Sub(p.lastPlayURLAt)
+				if since < time.Duration(float64(expected)*earlyIdleThresholdRatio) {
+					log.Printf("⏸️ [music/player] 忽略 Idle: 只播放了 %v/%v (<%.0f%%)，判定为设备被手动暂停/停止"+
+						"（比如按了物理暂停键），不自动切下一首",
+						since.Round(time.Second), expected.Round(time.Second), earlyIdleThresholdRatio*100)
+					p.state = StateIdle
+					return
+				}
 			}
 		}
 		log.Printf("🎚️ [music/player] 状态转换 Playing→Idle, 触发自动切歌 (mode=%d)", p.mode)
