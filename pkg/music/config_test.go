@@ -35,8 +35,8 @@ func TestApplyDefaultsAddsPlayerDiagnosticDefaults(t *testing.T) {
 	var cfg MusicConfig
 	cfg.ApplyDefaults()
 
-	if cfg.Player.DiagnosticIntervalSec == nil || *cfg.Player.DiagnosticIntervalSec != 15 {
-		t.Fatalf("expected default diagnostic interval 15, got %+v", cfg.Player.DiagnosticIntervalSec)
+	if cfg.Player.DiagnosticIntervalSec == nil || *cfg.Player.DiagnosticIntervalSec != 0 {
+		t.Fatalf("expected diagnostic interval disabled (0) by default, got %+v", cfg.Player.DiagnosticIntervalSec)
 	}
 }
 
@@ -44,11 +44,20 @@ func TestApplyDefaultsAddsPlayerWatchdogDefaults(t *testing.T) {
 	var cfg MusicConfig
 	cfg.ApplyDefaults()
 
-	if cfg.Player.WatchdogEnabled == nil || !*cfg.Player.WatchdogEnabled {
-		t.Fatalf("expected watchdog enabled by default, got %+v", cfg.Player.WatchdogEnabled)
+	if cfg.Player.WatchdogEnabled == nil || *cfg.Player.WatchdogEnabled {
+		t.Fatalf("expected watchdog disabled by default (heartbeat is the recommended defense), got %+v", cfg.Player.WatchdogEnabled)
 	}
 	if cfg.Player.PreemptMarginSec == nil || *cfg.Player.PreemptMarginSec != 2 {
 		t.Fatalf("expected default preempt margin 2s, got %+v", cfg.Player.PreemptMarginSec)
+	}
+}
+
+func TestApplyDefaultsAddsAbortHeartbeatDefault(t *testing.T) {
+	var cfg MusicConfig
+	cfg.ApplyDefaults()
+
+	if cfg.Commands.AbortHeartbeatIntervalSec == nil || *cfg.Commands.AbortHeartbeatIntervalSec != 30 {
+		t.Fatalf("expected default abort heartbeat interval 30s, got %+v", cfg.Commands.AbortHeartbeatIntervalSec)
 	}
 }
 

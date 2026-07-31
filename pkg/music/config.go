@@ -56,7 +56,13 @@ type CommandsConfig struct {
 	//
 	// 通过在本地队列活跃期间周期性重复 AbortXiaoAI，在云端每次重新连接、还没攒够触发
 	// resume 的时间窗口内就把它再打断一次，从源头上不给它机会。
-	// 默认 60 秒；设为 0（显式配置指针指向 0）可关闭这个心跳。
+	//
+	// 实测记录（2026-07-31）：把间隔调到 30 秒（比默认更频繁）后，之前"自动切一次下一集，
+	// 再往后被切到喜马拉雅内容"的问题就没再复现过，效果比预期的好——虽然理论上 CP 续播
+	// 跟 mico_aivs_lab 是两套不同机制（见 PlayerConfig 注释），但更频繁地重启似乎确实能
+	// 压低触发概率。默认值从 60 秒调到了 30 秒。
+	//
+	// 默认 30 秒；设为 0（显式配置指针指向 0）可关闭这个心跳。
 	AbortHeartbeatIntervalSec *int `yaml:"abort_xiaoai_heartbeat_sec,omitempty"`
 }
 
@@ -100,10 +106,17 @@ type LXConfig struct {
 // 实测记录（2026-07-31）：4 首歌连续通过主动续播成功切歌，全程诊断快照从未再出现
 // `audio_meta.cp` 字段，证明这个策略确实能稳定抢在 CP 续播之前拿到控制权。
 //
+// 但后续实测发现，单独把 `commands.abort_xiaoai_heartbeat_sec` 调到 30 秒（不开
+// WatchdogEnabled、不开诊断）也能稳定避免这个问题复现，而且更简单、没有"牺牲每首歌
+// 最后几秒内容"的代价。所以把 WatchdogEnabled 和诊断快照的默认值都改成了关闭，作为
+// 可选的、更激进的兜底手段保留（主动续播这条路径本身已经过验证，需要时随时可以开）。
+//
 // 只对能解析出真实时长的 .mp3 生效（DurationMs>0）；其他格式/在线直链没有这个保护，
 // 完全依赖 Idle 事件本身。
 type PlayerConfig struct {
-	// WatchdogEnabled 是否启用上述主动续播机制，默认开启。
+	// WatchdogEnabled 是否启用上述主动续播机制。默认**关闭**——实测发现单独调低
+	// `commands.abort_xiaoai_heartbeat_sec` 就足够避免 CP 续播问题，不需要额外牺牲
+	// 每首歌尾部几秒内容。如果心跳方案对你的设备不够用，可以再打开这个。
 	WatchdogEnabled *bool `yaml:"watchdog_enabled,omitempty"`
 
 	// PreemptMarginSec 提前多少秒（在预估时长结束前）主动切到下一首。
@@ -111,8 +124,9 @@ type PlayerConfig struct {
 	PreemptMarginSec *int `yaml:"preempt_margin_sec,omitempty"`
 
 	// DiagnosticIntervalSec：播放期间周期性打印 `player_get_context` 原始输出的间隔（秒）。
-	// 纯诊断用途，不影响播放行为，用于持续观察设备端状态、确认上面这套机制是否还在正常
-	// 抢到控制权。默认 15 秒；设为 0 可关闭。
+	// 纯诊断用途，不影响播放行为，用于持续观察设备端状态、排查"自动切到别的内容"这类问题
+	// 是否复现。默认**关闭**（0）——已经用它定位到根因（喜马拉雅 CP 续播），日常运行不需要
+	// 一直开着刷日志；需要继续排查时随时可以打开，比如设成 15 秒。
 	DiagnosticIntervalSec *int `yaml:"diagnostic_interval_sec,omitempty"`
 }
 
@@ -198,22 +212,22 @@ func (c *MusicConfig) ApplyDefaults() {
 		c.Commands.AbortXiaoAIOnPlay = &t
 	}
 	if c.Commands.AbortHeartbeatIntervalSec == nil {
-		d := 60
+		d := 30
 		c.Commands.AbortHeartbeatIntervalSec = &d
 	}
 	if c.HTTP.Port <= 0 {
 		c.HTTP.Port = 18080
 	}
 	if c.Player.WatchdogEnabled == nil {
-		t := true
-		c.Player.WatchdogEnabled = &t
+		f := false
+		c.Player.WatchdogEnabled = &f
 	}
 	if c.Player.PreemptMarginSec == nil {
 		m := 2
 		c.Player.PreemptMarginSec = &m
 	}
 	if c.Player.DiagnosticIntervalSec == nil {
-		d := 15
+		d := 0
 		c.Player.DiagnosticIntervalSec = &d
 	}
 	for i := range c.Stories {
