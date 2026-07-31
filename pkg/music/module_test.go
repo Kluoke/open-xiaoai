@@ -2,6 +2,7 @@ package music
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -138,5 +139,70 @@ func TestHandlePlayDownloadsLXTrackWhenEnabled(t *testing.T) {
 	}
 	if len(played) != 1 || !strings.HasPrefix(played[0], "http://music.local/file/") {
 		t.Fatalf("expected local file URL to be played, got %v", played)
+	}
+}
+
+// TestHandlePlaySetsUpEpisodeContinuationAcrossBatches 覆盖"20 集播完接着播下一批"这个场景：
+// 曲库里有 25 集，max_results=20，第一次 handlePlay 应该只入队前 20 集（1~20），
+// 同时设置好续播回调；手动调用这个回调应该能拉到剩下的 21~25 集。
+func TestHandlePlaySetsUpEpisodeContinuationAcrossBatches(t *testing.T) {
+	abort := false
+	cfg := &MusicConfig{
+		Enabled:  true,
+		Dirs:     []string{"/gushi"},
+		Search:   SearchConfig{MaxResults: 20},
+		Commands: CommandsConfig{AbortXiaoAIOnPlay: &abort},
+	}
+	cfg.ApplyDefaults()
+
+	idx := NewIndexer(cfg)
+	songs := make([]IndexedSong, 0, 25)
+	for ep := 1; ep <= 25; ep++ {
+		songs = append(songs, IndexedSong{
+			Path:      filepath.Join("/gushi", fmt.Sprintf("%03d.mp3", ep)),
+			NameLower: fmt.Sprintf("测试故事%03d", ep),
+			Episode:   ep,
+		})
+	}
+	idx.songs = songs
+
+	fileSrv := NewFileServer(&HTTPConfig{Port: 18080, BaseURL: "http://music.local"})
+	played := []string{}
+	player := NewPlayer(fileSrv, idx)
+	player.playURL = func(url string) error {
+		played = append(played, url)
+		return nil
+	}
+	player.speak = func(text string) error { return nil }
+
+	module := &Module{
+		config:  cfg,
+		indexer: idx,
+		fileSrv: fileSrv,
+		player:  player,
+	}
+
+	if !module.handlePlay("故事测试故事第1集") {
+		t.Fatal("expected handlePlay to succeed")
+	}
+	if len(played) != 1 {
+		t.Fatalf("expected first episode to start playing, played=%v", played)
+	}
+	if len(player.queue) != 19 { // 20 首入队，第一首已经出队播放，剩 19 首
+		t.Fatalf("expected 19 remaining items in queue after first play, got %d", len(player.queue))
+	}
+
+	if player.onExhausted == nil {
+		t.Fatal("expected episode continuation handler to be set")
+	}
+	more := player.onExhausted()
+	if len(more) != 5 {
+		t.Fatalf("expected continuation to fetch remaining 5 episodes (21-25), got %d: %+v", len(more), more)
+	}
+
+	// 续播用完之后（没有第 26 集了），再调用一次应该返回空，不会死循环重复拉同一批。
+	again := player.onExhausted()
+	if len(again) != 0 {
+		t.Fatalf("expected no more episodes after exhausting all 25, got %d", len(again))
 	}
 }

@@ -76,6 +76,7 @@ func (m *Module) Start(ctx context.Context) error {
 	}
 	log.Printf("🎵 [music] 启动中: dirs=%v exts=%v max_results=%d refresh=%.1fs",
 		m.config.Dirs, m.config.Extensions, m.config.Search.MaxResults, m.config.Search.RefreshIntervalSec)
+	m.warnUnscannedStoryDirs()
 
 	// base_url：配置覆盖或自动检测
 	if m.config.HTTP.BaseURL != "" {
@@ -83,7 +84,12 @@ func (m *Module) Start(ctx context.Context) error {
 		m.fileSrv.SetBaseURL(strings.TrimSuffix(m.config.HTTP.BaseURL, "/"))
 	}
 
-	m.player = NewPlayer(m.fileSrv, m.indexer)
+	watchdogEnabled := m.config.Player.WatchdogEnabled == nil || *m.config.Player.WatchdogEnabled
+	preemptMarginSec := 0
+	if m.config.Player.PreemptMarginSec != nil {
+		preemptMarginSec = *m.config.Player.PreemptMarginSec
+	}
+	m.player = NewPlayer(m.fileSrv, m.indexer, WithWatchdog(watchdogEnabled), WithPreemptMargin(preemptMarginSec))
 
 	// 先尝试加载磁盘缓存，让 Start 立刻就能用到已有曲库。
 	// 增量 Refresh 移到后台异步执行（10k+ FLAC 元数据可能需要几秒），
@@ -104,6 +110,41 @@ func (m *Module) Start(ctx context.Context) error {
 	m.jobWg.Add(1)
 	go m.jobLoop()
 
+	// 主动续播机制：抢在设备原生第三方内容源续播机制之前拿到控制权（见 PlayerConfig 注释）
+	m.refreshWg.Add(1)
+	go func() {
+		defer m.refreshWg.Done()
+		m.player.WatchdogLoop(m.ctx)
+	}()
+
+	// 播放期间周期性 AbortXiaoAI：防止小爱云端在后台重新连接后把"之前暂停的故事/新闻"
+	// resume 到 mediaplayer，抢占我们本地队列。只在 abort_xiaoai_on_play 开启且间隔>0 时启动。
+	abortOnPlay := m.config.Commands.AbortXiaoAIOnPlay != nil && *m.config.Commands.AbortXiaoAIOnPlay
+	heartbeatSec := 0
+	if m.config.Commands.AbortHeartbeatIntervalSec != nil {
+		heartbeatSec = *m.config.Commands.AbortHeartbeatIntervalSec
+	}
+	if abortOnPlay && heartbeatSec > 0 {
+		m.refreshWg.Add(1)
+		go func() {
+			defer m.refreshWg.Done()
+			m.player.AbortXiaoAIHeartbeatLoop(m.ctx, time.Duration(heartbeatSec)*time.Second)
+		}()
+	}
+
+	// 诊断快照：排查"自动切到别的内容"问题的根因用，见 PlayerConfig.DiagnosticIntervalSec 注释
+	diagnosticSec := 0
+	if m.config.Player.DiagnosticIntervalSec != nil {
+		diagnosticSec = *m.config.Player.DiagnosticIntervalSec
+	}
+	if diagnosticSec > 0 {
+		m.refreshWg.Add(1)
+		go func() {
+			defer m.refreshWg.Done()
+			m.player.DiagnosticContextLoop(m.ctx, time.Duration(diagnosticSec)*time.Second)
+		}()
+	}
+
 	// 后台首轮 Refresh：不阻塞 Start
 	m.refreshWg.Add(1)
 	go m.initialRefresh()
@@ -118,6 +159,48 @@ func (m *Module) Start(ctx context.Context) error {
 	log.Printf("✅ [music] 模块已启动: HTTP %s, 曲库缓存 %d 首 (首轮 Refresh 后台进行中)",
 		m.fileSrv.BaseURL(), len(m.indexer.Songs()))
 	return nil
+}
+
+// warnUnscannedStoryDirs 检查每个 stories[].dir 是否落在 music.dirs 扫描范围内。
+// 常见误配置：只把 stories[].dir 配成故事目录，却忘了把这个目录（或其上级目录）
+// 加进 music.dirs——indexer 只扫描 dirs 里的路径，stories[].dir 只是拿来做"目录限定过滤"，
+// 不会额外触发扫描。结果就是 SearchEpisode 用目录限定后总是 0 命中，日志上不容易看出原因，
+// 这里在启动时提前打个明显的警告。
+func (m *Module) warnUnscannedStoryDirs() {
+	if len(m.config.Stories) == 0 {
+		return
+	}
+	absDirs := make([]string, 0, len(m.config.Dirs))
+	for _, d := range m.config.Dirs {
+		abs, err := filepath.Abs(d)
+		if err != nil {
+			continue
+		}
+		absDirs = append(absDirs, strings.TrimSuffix(abs, string(filepath.Separator)))
+	}
+	for _, st := range m.config.Stories {
+		if st.Dir == "" {
+			continue
+		}
+		absStoryDir, err := filepath.Abs(st.Dir)
+		if err != nil {
+			continue
+		}
+		absStoryDir = strings.TrimSuffix(absStoryDir, string(filepath.Separator))
+		covered := false
+		for _, d := range absDirs {
+			if absStoryDir == d || strings.HasPrefix(absStoryDir, d+string(filepath.Separator)) {
+				covered = true
+				break
+			}
+		}
+		if !covered {
+			log.Printf("⚠️ [music] stories[%q].dir=%s 不在 music.dirs=%v 扫描范围内！"+
+				"曲库不会索引这个目录下的文件，SearchEpisode 会一直 0 命中。"+
+				"请把这个目录（或它的上级目录）加进 music.dirs。",
+				st.Name, st.Dir, m.config.Dirs)
+		}
+	}
 }
 
 // initialRefresh 启动后第一次同步磁盘的曲库 Refresh，跑在后台 goroutine。
@@ -381,9 +464,9 @@ func (m *Module) handlePlay(keyword string) bool {
 		return true
 	}
 	intent := ParsePlayIntent(keyword)
-	useEpisode := intent.Episode > 0 || m.matchStory(intent.SeriesName)
-	log.Printf("🎵 [music] handlePlay: keyword=%q intent={series=%q episode=%d} useEpisode=%v",
-		keyword, intent.SeriesName, intent.Episode, useEpisode)
+	useEpisode := intent.Episode > 0 || intent.IsStory || m.matchStory(intent.SeriesName)
+	log.Printf("🎵 [music] handlePlay: keyword=%q intent={series=%q episode=%d isStory=%v} useEpisode=%v",
+		keyword, intent.SeriesName, intent.Episode, intent.IsStory, useEpisode)
 
 	var songs []IndexedSong
 	if !hasLocalDirs {
@@ -398,7 +481,11 @@ func (m *Module) handlePlay(keyword string) bool {
 		if !useEpisode && m.handleLXPlay(intent.SeriesName) {
 			return true
 		}
-		m.player.Speak(fmt.Sprintf("没有找到包含%s的歌曲", intent.SeriesName))
+		if useEpisode && intent.Episode > 0 {
+			m.player.Speak(fmt.Sprintf("没有找到%s第%d集，可能是集数超出范围了", intent.SeriesName, intent.Episode))
+		} else {
+			m.player.Speak(fmt.Sprintf("没有找到包含%s的歌曲", intent.SeriesName))
+		}
 		return true
 	}
 	log.Printf("🔍 [music] 搜索命中 %d 首, 首条=%s", len(songs), songs[0].Path)
@@ -426,8 +513,59 @@ func (m *Module) handlePlay(keyword string) bool {
 
 	_ = m.player.Speak(feedback)
 
+	// 故事/按集播放：设置续播回调，这一批 20 集放完后自动拉取下一批（21~40 集……），
+	// 不需要把 search.max_results 开得很大去一次性入队整季（那样会连带影响普通音乐
+	// 搜索/随机播放的结果条数）。非按集播放（普通搜索）清空续播回调，避免残留上一次
+	// 故事播放的续播逻辑错误地接到这次不相关的播放上。
+	if useEpisode {
+		m.player.SetExhaustedHandler(m.buildEpisodeContinuation(intent.SeriesName, songs))
+	} else {
+		m.player.SetExhaustedHandler(nil)
+	}
+
 	m.player.SetQueue(items)
 	return true
+}
+
+// buildEpisodeContinuation 构造"这一批集数播完后，自动拉取下一批"的续播回调。
+// seriesName/maxResults 通过闭包捕获；lastEpisode 每次续播成功后更新，指向下一次应该
+// 从哪一集继续拉取。返回 nil 表示这批里没有可推算的集数（比如全是 Episode=0 的未知项），
+// 不启用续播，交给正常的"队列耗尽就停止"逻辑处理。
+func (m *Module) buildEpisodeContinuation(seriesName string, firstBatch []IndexedSong) func() []SongItem {
+	lastEpisode := maxEpisodeIn(firstBatch)
+	if lastEpisode <= 0 {
+		return nil
+	}
+	maxResults := m.config.Search.MaxResults
+	return func() []SongItem {
+		next := lastEpisode + 1
+		more := m.indexer.SearchEpisode(seriesName, next, maxResults)
+		if len(more) == 0 {
+			return nil
+		}
+		newLast := maxEpisodeIn(more)
+		if newLast <= lastEpisode {
+			// 防御性检查：拉到的批次没有更靠后的集数（比如重复返回同一批），
+			// 视为已经放完，避免死循环。
+			log.Printf("➡️ [music] 续播防御: series=%q 拉到的批次没有更靠后的集数 (last=%d new=%d)，视为已放完",
+				seriesName, lastEpisode, newLast)
+			return nil
+		}
+		log.Printf("🔍 [music] 续播: series=%q 拉取下一批 从第%d集开始 → %d 项", seriesName, next, len(more))
+		lastEpisode = newLast
+		return m.player.BuildQueueFromSongs(more)
+	}
+}
+
+// maxEpisodeIn 返回一批歌曲里最大的 Episode（0 表示这批里没有可用的集数信息）。
+func maxEpisodeIn(songs []IndexedSong) int {
+	max := 0
+	for _, s := range songs {
+		if s.Episode > max {
+			max = s.Episode
+		}
+	}
+	return max
 }
 
 func (m *Module) handleLXPlay(keyword string) bool {
@@ -456,11 +594,13 @@ func (m *Module) handleLXPlay(keyword string) bool {
 	if m.config.LX.Download {
 		if item, ok := m.downloadLXTrack(ctx, track, name); ok {
 			_ = m.player.Speak(fmt.Sprintf("好的，已下载在线歌曲%s", name))
+			m.player.SetExhaustedHandler(nil)
 			m.player.SetQueue([]SongItem{item})
 			return true
 		}
 	}
 	_ = m.player.Speak(fmt.Sprintf("好的，找到在线歌曲%s", name))
+	m.player.SetExhaustedHandler(nil)
 	m.player.SetQueue([]SongItem{{
 		Path: fmt.Sprintf("lx:%s-%s", track.Singer, name),
 		URL:  track.URL,
@@ -648,6 +788,7 @@ func (m *Module) handleRandomPlay(text string) bool {
 
 	m.player.StopTTS()
 	m.player.Speak(fmt.Sprintf("好的，随机播放%d首歌曲", len(items)))
+	m.player.SetExhaustedHandler(nil)
 	m.player.SetQueue(items)
 	return true
 }

@@ -70,3 +70,73 @@ func TestParsePlayIntentDoesNotEatNakedTrailingNumber(t *testing.T) {
 		}
 	}
 }
+
+func TestParsePlayIntentMarksStoryPrefix(t *testing.T) {
+	cases := []struct {
+		in      string
+		series  string
+		ep      int
+		isStory bool
+	}{
+		{"故事西游记第11集", "西游记", 11, true},
+		{"有声书三国演义", "三国演义", 0, true},
+		{"故事三国第一季第48集", "三国第一季", 48, true},
+		{"歌曲周杰伦晴天", "周杰伦晴天", 0, false},
+		{"周杰伦晴天", "周杰伦晴天", 0, false},
+	}
+	for _, c := range cases {
+		got := ParsePlayIntent(c.in)
+		if got.SeriesName != c.series || got.Episode != c.ep || got.IsStory != c.isStory {
+			t.Errorf("ParsePlayIntent(%q) = {%q, %d, isStory=%v}, want {%q, %d, isStory=%v}",
+				c.in, got.SeriesName, got.Episode, got.IsStory, c.series, c.ep, c.isStory)
+		}
+	}
+}
+
+func TestParsePlayIntentSupportsChineseEpisodeNumerals(t *testing.T) {
+	// 小爱 ASR 对个位数经常转写成中文数字（"第六集"）而不是"第6集"。
+	cases := []struct {
+		in     string
+		series string
+		ep     int
+	}{
+		{"故事三国第六集", "三国", 6},
+		{"故事三国第二十三集", "三国", 23},
+		{"故事三国第一百集", "三国", 100},
+		{"故事三国第一百二十九集", "三国", 129},
+		{"水浒传第五回", "水浒传", 5},
+		{"西游记第十回", "西游记", 10},
+	}
+	for _, c := range cases {
+		got := ParsePlayIntent(c.in)
+		if got.SeriesName != c.series || got.Episode != c.ep {
+			t.Errorf("ParsePlayIntent(%q) = {%q, %d}, want {%q, %d}",
+				c.in, got.SeriesName, got.Episode, c.series, c.ep)
+		}
+	}
+}
+
+func TestChineseNumeralToInt(t *testing.T) {
+	cases := map[string]int{
+		"零":     0,
+		"六":     6,
+		"十":     10,
+		"十五":    15,
+		"二十":    20,
+		"二十三":   23,
+		"一百":    100,
+		"一百零五":  105,
+		"一百二十九": 129,
+		"九百九十九": 999,
+	}
+	for in, want := range cases {
+		got, ok := chineseNumeralToInt(in)
+		if !ok {
+			t.Errorf("chineseNumeralToInt(%q) failed to parse", in)
+			continue
+		}
+		if got != want {
+			t.Errorf("chineseNumeralToInt(%q) = %d, want %d", in, got, want)
+		}
+	}
+}

@@ -167,20 +167,52 @@ func (i *Indexer) SearchEpisode(seriesName string, episode int, maxResults int) 
 	if seriesLower == "" {
 		return nil
 	}
-	// 解析别名
+
+	// 解析别名，同时尽量定位到具体的 story 配置（用于目录限定）。
+	// 先精确匹配（避免"三国"这种短关键词在有多季配置时被贪心地模糊命中第一季），
+	// 精确匹配失败再退化为双向包含的模糊匹配。
 	resolvedName := seriesLower
-	for _, s := range i.config.Stories {
-		nameLower := strings.ToLower(s.Name)
-		if nameLower == seriesLower {
-			resolvedName = nameLower
+	var matchedStory *StoryConfig
+	for idx := range i.config.Stories {
+		st := &i.config.Stories[idx]
+		if strings.ToLower(st.Name) == seriesLower {
+			matchedStory = st
 			break
 		}
-		for _, a := range s.Aliases {
+		for _, a := range st.Aliases {
 			if strings.ToLower(a) == seriesLower {
-				resolvedName = nameLower
+				matchedStory = st
 				break
 			}
 		}
+		if matchedStory != nil {
+			break
+		}
+	}
+	if matchedStory == nil {
+		for idx := range i.config.Stories {
+			st := &i.config.Stories[idx]
+			nameLower := strings.ToLower(st.Name)
+			if strings.Contains(seriesLower, nameLower) || strings.Contains(nameLower, seriesLower) {
+				matchedStory = st
+				break
+			}
+			matchedAlias := false
+			for _, a := range st.Aliases {
+				aLower := strings.ToLower(a)
+				if strings.Contains(seriesLower, aLower) || strings.Contains(aLower, seriesLower) {
+					matchedStory = st
+					matchedAlias = true
+					break
+				}
+			}
+			if matchedAlias {
+				break
+			}
+		}
+	}
+	if matchedStory != nil {
+		resolvedName = strings.ToLower(matchedStory.Name)
 	}
 
 	i.mu.RLock()
@@ -188,25 +220,25 @@ func (i *Indexer) SearchEpisode(seriesName string, episode int, maxResults int) 
 	copy(songs, i.songs)
 	i.mu.RUnlock()
 
-	matched := make([]IndexedSong, 0, min(len(songs), maxResults))
-	for _, s := range songs {
-		if !containsAny(s, resolvedName) {
-			continue
-		}
-		include := true
-		for _, st := range i.config.Stories {
-			if strings.ToLower(st.Name) == resolvedName && st.Dir != "" {
-				absDir, _ := filepath.Abs(st.Dir)
-				absPath, _ := filepath.Abs(s.Path)
-				absDir = strings.TrimSuffix(absDir, string(filepath.Separator))
-				if absPath != absDir && !strings.HasPrefix(absPath, absDir+string(filepath.Separator)) {
-					include = false
-				}
-				break
+	var matched []IndexedSong
+	if matchedStory != nil && matchedStory.Dir != "" {
+		// 目录已经精确限定了这一季/这个系列：不再要求文件名/标签里包含关键词，
+		// 避免"第01集.mp3"这类文件名本身不含系列名而被漏检；也天然解决了多季共用
+		// 集数编号（每季都从 001 开始）时的系列歧义问题。
+		absDir, _ := filepath.Abs(matchedStory.Dir)
+		absDir = strings.TrimSuffix(absDir, string(filepath.Separator))
+		for _, s := range songs {
+			absPath, _ := filepath.Abs(s.Path)
+			if absPath == absDir || strings.HasPrefix(absPath, absDir+string(filepath.Separator)) {
+				matched = append(matched, s)
 			}
 		}
-		if include {
-			matched = append(matched, s)
+		log.Printf("🔍 [music/search] SearchEpisode: 使用目录限定 dir=%s，命中 %d 项", absDir, len(matched))
+	} else {
+		for _, s := range songs {
+			if containsAny(s, resolvedName) {
+				matched = append(matched, s)
+			}
 		}
 	}
 
@@ -231,23 +263,31 @@ func (i *Indexer) SearchEpisode(seriesName string, episode int, maxResults int) 
 		return ea < eb
 	})
 
-	if len(matched) > maxResults {
-		matched = matched[:maxResults]
-	}
-
+	// 注意：必须先按 episode 定位起始位置，再截断 maxResults。
+	// 之前的实现反过来（先截断到 maxResults 条，再在截断后的子集里找 episode），
+	// 当系列总集数 > maxResults 时（比如 729 集，max_results=20），排序后的前 20 条
+	// 全是第 1~20 集，"从第 199 集开始播放"这类请求在这个子集里永远找不到 >= 199 的项，
+	// for 循环找不到就默认 from=0，于是又从第 1 集悄悄重播——用户会觉得"怎么老是播开头"。
 	if episode > 0 {
-		// 找到指定集数或第一个 >= 该集数的，从该位置开始返回
-		from := 0
+		// 找到指定集数或第一个 >= 该集数的，从该位置开始返回；
+		// 找不到（请求的集数超出系列最大集数）则返回空，不能默默回退到从头播放。
+		from := -1
 		for idx, s := range matched {
 			if s.Episode >= episode {
 				from = idx
 				break
 			}
 		}
-		matched = matched[from:]
-		if len(matched) > maxResults {
-			matched = matched[:maxResults]
+		if from == -1 {
+			log.Printf("🔍 [music/search] SearchEpisode: series=%q (resolved=%q) 请求第%d集超出范围 (共%d集)",
+				seriesName, resolvedName, episode, len(matched))
+			return nil
 		}
+		matched = matched[from:]
+	}
+
+	if len(matched) > maxResults {
+		matched = matched[:maxResults]
 	}
 
 	log.Printf("🔍 [music/search] SearchEpisode: series=%q (resolved=%q) episode=%d → %d 项 (首条 ep=%d)",

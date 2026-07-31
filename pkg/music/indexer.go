@@ -42,6 +42,14 @@ type IndexedSong struct {
 	Size        int64  `json:"size"`
 	MtimeNs     int64  `json:"mtime_ns"`
 	Episode     int    `json:"episode,omitempty"` // 集数，0 表示非分集或未知
+	// DurationMs 播放时长（毫秒），目前只对 .mp3 通过解析真实帧头（CBR 假设）计算，
+	// 其他格式暂不支持，值为 0。0 表示"未知"，Player 看门狗遇到 0 会跳过基于时长的判断。
+	//
+	// 为什么不用"文件大小 / 假设比特率"去猜：不同来源的音频真实比特率差异很大
+	// （有声书/评书常见 64~128kbps，音乐常见 128~320kbps），固定假设一个值猜出来的
+	// 时长可能比真实时长短一半，会导致看门狗在歌曲远没播完时就误判"早该播完了"提前切歌。
+	// 直接解析帧头里编码的真实比特率来算，是数据来源，不是猜测。
+	DurationMs int64 `json:"duration_ms,omitempty"`
 }
 
 // Indexer 曲库索引器
@@ -268,17 +276,23 @@ func (i *Indexer) Refresh() error {
 			continue
 		}
 		old, ok := oldByPath[path]
-		if !ok || old.Size != info.Size() || old.MtimeNs != info.ModTime().UnixNano() {
+		// needsDurationBackfill：老版本索引缓存（本次修复之前生成）没有 DurationMs 字段，
+		// size/mtime 没变也要强制重新提取一次，把时长补上，不然看门狗永远拿不到这首歌的
+		// 真实时长（会一直被当成"未知"跳过，起不到兜底作用）。只在文件本身没变时补一次，
+		// 补上之后下次 Refresh 就会走"未变直接复用"分支，不会每次启动都重新探测。
+		needsDurationBackfill := ok && old.DurationMs == 0 && strings.EqualFold(filepath.Ext(path), ".mp3")
+		if !ok || old.Size != info.Size() || old.MtimeNs != info.ModTime().UnixNano() || needsDurationBackfill {
 			needRefresh = append(needRefresh, path)
 		}
 	}
 
-	// 未变的直接复用
+	// 未变的直接复用（同时也要排除需要补时长字段的，让它们走下面的并发提取重新算一次）
 	newSongs := make([]IndexedSong, 0, len(files))
 	for _, path := range files {
 		if old, ok := oldByPath[path]; ok {
 			info, err := os.Stat(path)
-			if err == nil && old.Size == info.Size() && old.MtimeNs == info.ModTime().UnixNano() {
+			needsDurationBackfill := old.DurationMs == 0 && strings.EqualFold(filepath.Ext(path), ".mp3")
+			if err == nil && old.Size == info.Size() && old.MtimeNs == info.ModTime().UnixNano() && !needsDurationBackfill {
 				newSongs = append(newSongs, old)
 				continue
 			}
@@ -380,6 +394,14 @@ func extractMetadata(path string) (IndexedSong, error) {
 	name := strings.TrimSuffix(base, ext)
 	s.NameLower = strings.ToLower(name)
 	s.Episode = extractEpisodeFromName(name)
+
+	if strings.EqualFold(ext, ".mp3") {
+		if dur, err := probeMP3Duration(path, s.Size); err == nil && dur > 0 {
+			s.DurationMs = dur.Milliseconds()
+		} else if err != nil {
+			log.Printf("⚠️ [music/idx] 解析 mp3 时长失败 (看门狗对这首歌不生效): %s err=%v", path, err)
+		}
+	}
 
 	f, err := os.Open(path)
 	if err != nil {

@@ -31,6 +31,27 @@ func TestApplyDefaultsAddsLXDefaults(t *testing.T) {
 	}
 }
 
+func TestApplyDefaultsAddsPlayerDiagnosticDefaults(t *testing.T) {
+	var cfg MusicConfig
+	cfg.ApplyDefaults()
+
+	if cfg.Player.DiagnosticIntervalSec == nil || *cfg.Player.DiagnosticIntervalSec != 15 {
+		t.Fatalf("expected default diagnostic interval 15, got %+v", cfg.Player.DiagnosticIntervalSec)
+	}
+}
+
+func TestApplyDefaultsAddsPlayerWatchdogDefaults(t *testing.T) {
+	var cfg MusicConfig
+	cfg.ApplyDefaults()
+
+	if cfg.Player.WatchdogEnabled == nil || !*cfg.Player.WatchdogEnabled {
+		t.Fatalf("expected watchdog enabled by default, got %+v", cfg.Player.WatchdogEnabled)
+	}
+	if cfg.Player.PreemptMarginSec == nil || *cfg.Player.PreemptMarginSec != 2 {
+		t.Fatalf("expected default preempt margin 2s, got %+v", cfg.Player.PreemptMarginSec)
+	}
+}
+
 func assertContains(t *testing.T, values []string, want string) {
 	t.Helper()
 	for _, v := range values {

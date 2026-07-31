@@ -95,6 +95,12 @@ const (
 type SongItem struct {
 	Path string
 	URL  string
+	// Size 文件字节数，来自 IndexedSong.Size，目前仅用于日志/诊断。
+	Size int64
+	// DurationMs 播放时长（毫秒），来自 IndexedSong.DurationMs（解析 mp3 帧头真实比特率算出的）。
+	// 用于主动续播机制判断"这首歌是不是快播完了"；0 表示未知（比如 LX 在线直链、非 mp3、
+	// 解析失败），此时主动续播对这首歌不生效，完全依赖真正的 Idle 事件。
+	DurationMs int64
 }
 
 // Player 播放器：队列、RPC 调用、Idle 切歌
@@ -111,11 +117,28 @@ type Player struct {
 	playURL     func(url string) error
 	speak       func(text string) error
 	abortXiaoAI func() error
+	// runShell 可覆盖的 shell 执行入口（测试用），默认 nil 时走真实 RPC。
+	runShell func(script string) (stdout string, err error)
 
-	// lastPlayURLAt 上次主动 PlayURL 的时间戳，用于 grace period 内过滤 Idle 误报
+	// lastPlayURLAt 上次主动 PlayURL 的时间戳，用于 grace period 内过滤 Idle 误报，
+	// 也用于主动续播机制判断"这首歌是不是快播完了"。
 	lastPlayURLAt time.Time
 	// suppressUntil 显式抑制 OnPlayingStatus 处理的截止时间（Speak 期间会撑开此窗口）
 	suppressUntil time.Time
+
+	// watchdogEnabled：主动续播机制开关；preemptMargin：提前多久切下一首。见 PlayerConfig 注释。
+	watchdogEnabled bool
+	preemptMargin   time.Duration
+
+	// onExhausted 队列和 playlist 都耗尽（PlaybackModeSequence 顺序播放模式）时的续播回调，
+	// 主要给"故事/有声书按集播放"用：与其把 search.max_results 开得很大一次性入队整季
+	// （那样会连带影响普通音乐搜索/随机播放的结果条数），不如在当前这一批放完时按需再取下一批。
+	//
+	// 返回非空 []SongItem 表示"还有更多，接着放"；返回 nil/空表示"真的没有了，正常停止"。
+	//
+	// 约束：这个回调在 nextLocked() 持有 p.mu 时被调用，不能反过来调用 Player 上任何需要
+	// 获取 p.mu 的方法（会死锁）——只应该是纯查询（比如调 Indexer.SearchEpisode），不碰 Player 状态。
+	onExhausted func() []SongItem
 
 	// initialStateCh 在收到第一个 playing 事件时关闭，用来给上层"等一下首个状态"的能力，
 	// 取代之前注释里建议的 Sleep 推断（不可靠）。
@@ -124,11 +147,38 @@ type Player struct {
 }
 
 // NewPlayer 创建播放器
-func NewPlayer(fs *FileServer, idx *Indexer) *Player {
-	return &Player{
-		fileServer:     fs,
-		indexer:        idx,
-		initialStateCh: make(chan struct{}),
+func NewPlayer(fs *FileServer, idx *Indexer, opts ...PlayerOption) *Player {
+	p := &Player{
+		fileServer:      fs,
+		indexer:         idx,
+		initialStateCh:  make(chan struct{}),
+		watchdogEnabled: true,
+		preemptMargin:   defaultPreemptMargin,
+	}
+	for _, opt := range opts {
+		opt(p)
+	}
+	return p
+}
+
+// PlayerOption NewPlayer 的可选配置项
+type PlayerOption func(*Player)
+
+// WithWatchdog 配置主动续播机制的开关（见 PlayerConfig 注释）。
+func WithWatchdog(enabled bool) PlayerOption {
+	return func(p *Player) {
+		p.watchdogEnabled = enabled
+	}
+}
+
+// WithPreemptMargin 配置提前多久（在预估时长结束前）主动切到下一首，见 PlayerConfig 注释。
+// seconds<=0 时使用默认值 defaultPreemptMargin，不会被设成 0（那样就失去了"抢在设备原生
+// 续播机制之前拿到控制权"的意义）。
+func WithPreemptMargin(seconds int) PlayerOption {
+	return func(p *Player) {
+		if seconds > 0 {
+			p.preemptMargin = time.Duration(seconds) * time.Second
+		}
 	}
 }
 
@@ -561,9 +611,29 @@ func (p *Player) nextLocked(recordHistory bool) bool {
 		}
 		return p.playNextLocked(recordHistory)
 	default:
+		if more := p.tryFetchMoreLocked(); len(more) > 0 {
+			p.queue = more
+			p.playlist = copySongItems(more)
+			return p.playNextLocked(recordHistory)
+		}
 		log.Printf("➡️ [music/player] 队列耗尽 (mode=sequence)，停止")
 		return false
 	}
+}
+
+// tryFetchMoreLocked 调用方需已持锁。队列/playlist 都耗尽时尝试通过 onExhausted 拉取
+// 下一批（典型场景：故事按集播放，当前这 20 集放完了，接着拉 21~40 集）。
+// 没有设置回调、或回调返回空，都视为"真的没有更多了"。
+func (p *Player) tryFetchMoreLocked() []SongItem {
+	if p.onExhausted == nil {
+		return nil
+	}
+	more := p.onExhausted()
+	if len(more) == 0 {
+		return nil
+	}
+	log.Printf("➡️ [music/player] 队列耗尽，自动续播下一批: %d 首", len(more))
+	return more
 }
 
 // Previous 用户主动"上一首"。同 Next，RepeatOne 也跳出当前曲。
@@ -588,6 +658,16 @@ func (p *Player) SetMode(mode PlaybackMode) {
 		log.Printf("🎚️ [music/player] 播放模式: %d → %d", p.mode, mode)
 	}
 	p.mode = mode
+}
+
+// SetExhaustedHandler 设置/清空队列耗尽时的续播回调，见 onExhausted 字段注释。
+// 传 nil 表示禁用续播（队列耗尽就正常停止）——每次 SetQueue 一批新内容时，调用方应该
+// 显式设置（故事/按集播放场景）或清空（普通搜索/随机播放场景）它，避免残留上一次的续播
+// 逻辑错误地接到这一次不相关的播放上。
+func (p *Player) SetExhaustedHandler(fn func() []SongItem) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.onExhausted = fn
 }
 
 func (p *Player) Mode() PlaybackMode {
@@ -624,7 +704,7 @@ func (p *Player) BuildQueueFromSongs(songs []IndexedSong) []SongItem {
 		p.fileServer.AllowFile(s.Path)
 		url := p.fileServer.CreateFileURL(s.Path)
 		if url != "" {
-			items = append(items, SongItem{Path: s.Path, URL: url})
+			items = append(items, SongItem{Path: s.Path, URL: url, Size: s.Size, DurationMs: s.DurationMs})
 		} else {
 			skipped++
 			log.Printf("⚠️ [music/player] BuildQueue 跳过 (URL 生成失败): %s", s.Path)
@@ -634,4 +714,216 @@ func (p *Player) BuildQueueFromSongs(songs []IndexedSong) []SongItem {
 		log.Printf("⚠️ [music/player] BuildQueue 完成: %d 首 (跳过 %d)", len(items), skipped)
 	}
 	return items
+}
+
+// advanceTickInterval 主动续播检查间隔。必须比 preemptMargin 小得多，否则会因为
+// tick 粒度太粗而错过"提前一点点"这个窗口，退化成事后才发现。
+const advanceTickInterval = 1 * time.Second
+
+// preemptMinMargin 提前量下限：即使配置成 0 或很小的值，也至少提前这么久发起下一首，
+// 保留一点点缓冲应对 RPC 往返延迟本身。
+const preemptMinMargin = 1 * time.Second
+
+// preemptMaxMarginRatio 提前量上限占真实时长的比例：不管配置多大，最多不超过时长的 20%，
+// 避免因为 CBR 估算误差或配置不当，把一首歌很大一截内容都提前切掉。
+const preemptMaxMarginRatio = 0.2
+
+// defaultPreemptMargin 默认提前量：在预估时长结束前这么久，就主动切到下一首。
+// 实测验证过 3s 能稳定抢在设备原生 CP 续播机制之前拿到控制权；2s 在后续实测里同样稳定有效，
+// 且能进一步缩小对每首歌尾部内容的影响，所以把默认值调小到 2s。
+const defaultPreemptMargin = 2 * time.Second
+
+// WatchdogLoop 主动续播机制：趁着我们已经能精确算出每首 mp3 真实播放时长（见
+// mp3duration.go），在预估时长结束前一点点就主动切到下一首——从根上避免设备进入
+// "真正 idle、且我们还没喂下一个 URL"的空窗期。
+//
+// 为什么必须是"提前"而不是"事后"：实测抓到了真正的根因——播放期间周期性 dump
+// `ubus call mediaplayer player_get_context`，在我们本地曲目自然播完的那个时间点附近，
+// 返回结果里突然多出一个 `audio_meta.cp.name = "ximalaya"` 字段，说明设备本身有一套
+// **跟 mico_aivs_lab 完全无关**的"第三方内容提供商（CP）续播"机制：只要 mediaplayer
+// 真正进入 idle 且没有新内容排队，它就会去恢复你之前用原生小爱在喜马拉雅上听到一半的
+// 内容。这个空窗期发生在"track 自然播完"和"我们轮询 mute_stat 检测到 Idle 再回传 RPC
+// 播下一首"这段往返延迟之内——纯被动等 Idle 事件、事后再反应，天生就会跟设备自己的这套
+// 内部机制赛跑，而设备本地触发比我们"轮询 + 网络往返"更快，我们经常会输掉这场比赛。
+// AbortXiaoAI 心跳杀的是 mico_aivs_lab，跟这套 CP 续播机制完全不搭边，所以怎么调都没用。
+//
+// 现在的策略：既然知道真实时长，就不用等它真的播完——提前 preemptMargin（默认 2 秒，
+// 留了 1 秒下限和"最多不超过时长 20%"的上限做保护）主动调用下一首的 PlayURL。
+// 这样设备端根本没有机会进入"idle 且没有下一个 URL"的状态，CP 续播自然没有可乘之机。
+// 真正的 Idle 事件依然正常处理（OnPlayingStatus），两者不冲突：谁先触发，"下一首"的
+// 队列弹出就已经完成，后到的那个只是操作在空队列/已变化的 currentSong 上，不会重复播放。
+//
+// 实测记录（2026-07-31）：4 首歌连续通过主动续播成功切歌，全程诊断快照从未再出现
+// `audio_meta.cp` 字段，证明这个策略确实能稳定抢在 CP 续播之前拿到控制权。
+//
+// 只对能解析出真实时长的 .mp3 生效（DurationMs>0）；其他格式/在线直链没有这个保护，
+// 完全依赖 Idle 事件本身。
+//
+// 阻塞直到 ctx 被取消，调用方应该在独立 goroutine 里跑。
+func (p *Player) WatchdogLoop(ctx context.Context) {
+	if !p.watchdogEnabled {
+		log.Printf("🐕 [music/player] 主动续播机制已禁用 (player.watchdog_enabled=false)")
+		return
+	}
+	log.Printf("🐕 [music/player] 主动续播机制已启用: 检查间隔=%v, 提前量=%v (只对能解析出真实时长的 mp3 生效)",
+		advanceTickInterval, p.preemptMargin)
+	ticker := time.NewTicker(advanceTickInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			p.checkWatchdog()
+		}
+	}
+}
+
+// checkWatchdog 单次检查：如果当前曲目已经接近（或超过）真实时长，就提前/及时推进到下一首，
+// 抢在设备端 CP 续播机制之前拿到"下一个要播的 URL 是什么"的控制权。
+func (p *Player) checkWatchdog() {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+
+	if p.state != StatePlaying || p.currentSong == nil {
+		return
+	}
+	now := time.Now()
+	// Speak/新指令处理期间的状态不可信，一并让路，避免跟正常流程打架。
+	if !p.suppressUntil.IsZero() && now.Before(p.suppressUntil) {
+		return
+	}
+	if p.lastPlayURLAt.IsZero() {
+		return
+	}
+	if p.currentSong.DurationMs <= 0 {
+		// 时长未知（非 mp3、解析失败、LX 在线直链等），不瞎猜，完全依赖 Idle 事件本身。
+		return
+	}
+	dur := time.Duration(p.currentSong.DurationMs) * time.Millisecond
+	margin := p.preemptMargin
+	if margin < preemptMinMargin {
+		margin = preemptMinMargin
+	}
+	if maxMargin := time.Duration(float64(dur) * preemptMaxMarginRatio); margin > maxMargin {
+		margin = maxMargin
+	}
+	preemptAt := p.lastPlayURLAt.Add(dur - margin)
+	if now.Before(preemptAt) {
+		return
+	}
+	log.Printf("🐕 [music/player] 主动续播: %s 预估时长=%v, 提前量=%v，距上次 PlayURL 已过 %v，"+
+		"抢在设备原生续播机制（如第三方内容源 CP 恢复）接管前主动切到下一首",
+		p.currentSong.Path, dur.Round(time.Second), margin.Round(time.Second),
+		now.Sub(p.lastPlayURLAt).Round(time.Second))
+	if p.mode == PlaybackModeRepeatOne {
+		p.replayCurrentLocked()
+	} else {
+		p.nextLocked(true)
+	}
+}
+
+// AbortXiaoAIHeartbeatLoop 在本地队列活跃播放期间，周期性重复调用 AbortXiaoAI
+// （重启 mico_aivs_lab），防止小爱云端在后台重新连接、重新同步账号状态后，把
+// "之前暂停的故事/新闻"resume 到 mediaplayer，抢占我们正在播放的本地队列。
+//
+// 背景（详见 CommandsConfig.AbortHeartbeatIntervalSec 的注释）：AbortXiaoAI 只在下达
+// 播放指令那一刻重启一次 mico_aivs_lab，但它是持续运行的本地代理，重启后几秒内就会自动
+// 重连云端、重新同步账号在云端记录的"上次暂停内容"。实测表现：本地队列能正常自动切
+// 一次下一集，再往后突然就换成了很久以前听到一半的别的内容，中间完全没有 Idle 事件——
+// 说明 mediaplayer 内部是被云端直接接管切换的，不是我们队列耗尽。
+//
+// 通过在本地队列仍在播放时周期性重复 AbortXiaoAI，在云端每次重新连接、还没攒够触发
+// resume 的时间窗口内就把它再打断一次，从源头上不给它机会。
+//
+// interval<=0 时直接返回（表示已禁用）。阻塞直到 ctx 被取消，调用方应该在独立 goroutine 里跑。
+func (p *Player) AbortXiaoAIHeartbeatLoop(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		log.Printf("🔇 [music/player] AbortXiaoAI 播放心跳已禁用 (interval<=0)")
+		return
+	}
+	log.Printf("🔇 [music/player] AbortXiaoAI 播放心跳已启用: 间隔=%v", interval)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			p.mu.Lock()
+			active := p.state == StatePlaying && p.currentSong != nil
+			// Speak/新指令处理期间自己就会做 AbortXiaoAI，心跳这次跳过，避免重复重启。
+			suppressed := !p.suppressUntil.IsZero() && time.Now().Before(p.suppressUntil)
+			p.mu.Unlock()
+			if !active || suppressed {
+				continue
+			}
+			log.Printf("🔇 [music/player] AbortXiaoAI 播放心跳: 重启 mico_aivs_lab，防止云端恢复后台暂停内容抢占")
+			_ = p.AbortXiaoAI()
+		}
+	}
+}
+
+// runShellCommand 执行一段 shell 脚本并返回 stdout，测试可通过 p.runShell 覆盖。
+func (p *Player) runShellCommand(script string, timeoutMs uint64) (string, error) {
+	if p.runShell != nil {
+		return p.runShell(script)
+	}
+	resp, err := connect.GetRPC().CallRemote("run_shell", script, &timeoutMs)
+	if err != nil {
+		return "", err
+	}
+	r := decodeShellResult(resp)
+	if r == nil {
+		return "", nil
+	}
+	return r.Stdout, nil
+}
+
+// snapshotDeviceContext 诊断用：拉取设备端 mediaplayer 的完整上下文（`player_get_context`），
+// 原样打印 stdout。
+//
+// 背景：连续两轮修复（看门狗时长估算、AbortXiaoAI 播放心跳）都没能解决"自动切一次下一集后，
+// 后面就被切到很久以前用原生小爱听到一半的别的内容"这个问题——心跳已经确认按预期每 60 秒
+// 稳定重启一次 mico_aivs_lab，但问题依旧复现，说明"mico_aivs_lab 重连后同步云端暂停内容"
+// 这个理论被证伪了，真正的触发源目前还不确定（有可能是另一个跟 mico_aivs_lab 无关的
+// 设备内部服务/定时任务）。
+//
+// 在确认真正机制之前继续瞎猜着修没有意义，所以先加这个纯诊断快照：周期性把
+// `player_get_context` 的原始输出打到日志里，下次问题复现时，对比"劫持前"和"劫持后"
+// 的快照，看看这个字段里有没有透露出真正在起作用的是谁（比如某个 album/track id 字段）。
+//
+// 目前不解析具体字段（没有官方文档，schema 未知），先把原始 JSON 打出来人工看。
+func (p *Player) snapshotDeviceContext(reason string) {
+	out, err := p.runShellCommand("ubus -t 2 call mediaplayer player_get_context 2>&1", 3000)
+	if err != nil {
+		log.Printf("🔬 [music/player] player_get_context 诊断快照失败 (%s): %v", reason, err)
+		return
+	}
+	log.Printf("🔬 [music/player] player_get_context 诊断快照 (%s): %s", reason, strings.TrimSpace(out))
+}
+
+// DiagnosticContextLoop 播放期间周期性打印 player_get_context 原始输出，纯诊断用途。
+// interval<=0 时直接返回（禁用）。阻塞直到 ctx 被取消，调用方应该在独立 goroutine 里跑。
+func (p *Player) DiagnosticContextLoop(ctx context.Context, interval time.Duration) {
+	if interval <= 0 {
+		return
+	}
+	log.Printf("🔬 [music/player] 诊断快照已启用: 间隔=%v (排查'自动切到别的内容'问题用，确认根因后会移除)", interval)
+	ticker := time.NewTicker(interval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ctx.Done():
+			return
+		case <-ticker.C:
+			p.mu.Lock()
+			active := p.state == StatePlaying && p.currentSong != nil
+			p.mu.Unlock()
+			if !active {
+				continue
+			}
+			p.snapshotDeviceContext("periodic")
+		}
+	}
 }

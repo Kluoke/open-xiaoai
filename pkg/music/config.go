@@ -9,6 +9,7 @@ type MusicConfig struct {
 	Commands   CommandsConfig `yaml:"commands"`
 	HTTP       HTTPConfig     `yaml:"http"`
 	LX         LXConfig       `yaml:"lx"`
+	Player     PlayerConfig   `yaml:"player"`
 	Stories    []StoryConfig  `yaml:"stories"` // 故事/有声书分类，用于精确匹配与集数解析
 }
 
@@ -43,6 +44,20 @@ type CommandsConfig struct {
 	// 解决"我们 player_play_url 本地歌后，小爱云端识别同一句话再返回试听版 URL 覆盖我们"的竞态。
 	// 默认 true，需要时可在 config.yaml 里 commands.abort_xiaoai_on_play: false 关掉。
 	AbortXiaoAIOnPlay *bool `yaml:"abort_xiaoai_on_play,omitempty"`
+
+	// AbortHeartbeatIntervalSec：本地队列播放期间，周期性重启 mico_aivs_lab 的间隔（秒）。
+	//
+	// 背景：AbortXiaoAIOnPlay 只在下达播放指令那一刻重启一次 mico_aivs_lab，但它是持续运行的
+	// 本地代理，重启后几秒内会自动重连小爱云端、重新同步账号在云端记录的"上次暂停内容"
+	// （新闻/故事类）。经过几分钟不活动后，云端会主动把"继续播放"推给 mediaplayer——这跟
+	// 我们本地队列是否还在放歌完全无关。实测表现：本地队列能正常自动切一次下一集，
+	// 再往后突然就换成了很久以前听到一半的别的内容，而且中间完全没有 Idle 事件
+	// （mediaplayer 内部直接切换，从未真正 Idle 过）。
+	//
+	// 通过在本地队列活跃期间周期性重复 AbortXiaoAI，在云端每次重新连接、还没攒够触发
+	// resume 的时间窗口内就把它再打断一次，从源头上不给它机会。
+	// 默认 60 秒；设为 0（显式配置指针指向 0）可关闭这个心跳。
+	AbortHeartbeatIntervalSec *int `yaml:"abort_xiaoai_heartbeat_sec,omitempty"`
 }
 
 // HTTPConfig HTTP 文件服务配置
@@ -64,6 +79,41 @@ type LXConfig struct {
 	Source       string `yaml:"source"`
 	Quality      string `yaml:"quality"`
 	TimeoutSec   int    `yaml:"timeout_sec"`
+}
+
+// PlayerConfig 播放器行为配置，核心是"主动续播"机制，用来抢在设备原生内容续播机制之前
+// 拿到"接下来该播什么"的控制权。
+//
+// 根因（已通过诊断快照实测确认）：设备 mediaplayer 自带一套跟 mico_aivs_lab 完全无关的
+// "第三方内容提供商（CP）续播"机制——只要 mediaplayer 真正进入 idle 且没有排队的下一个
+// URL，它就会去恢复你之前用原生小爱听到一半的内容（实测抓到 `player_get_context` 返回
+// `audio_meta.cp.name = "ximalaya"`，即喜马拉雅）。这个空窗期出现在"我们的 track 自然
+// 播完"和"我们轮询 mute_stat 检测到 Idle、再通过 RPC 往返播下一首"这段延迟之内——纯被动
+// 等 Idle 事件、事后再反应，天生要跟设备本地这套机制赛跑，而本地触发通常比我们的
+// "轮询 + 网络往返"更快，经常会输掉。
+//
+// WatchdogEnabled 开启后，Player 会用 IndexedSong.DurationMs（索引时解析 mp3 帧头真实
+// 比特率算出的播放时长，不是猜的）在预估时长结束前 PreemptMarginSec 秒就主动切到下一首，
+// 而不是等真的播完、等 Idle 事件、再反应——从根上不给设备的 CP 续播机制留出可乘的空窗期。
+// 真正的 Idle 事件依然正常处理，两者不冲突：谁先触发，"下一首"的队列弹出就已经完成。
+//
+// 实测记录（2026-07-31）：4 首歌连续通过主动续播成功切歌，全程诊断快照从未再出现
+// `audio_meta.cp` 字段，证明这个策略确实能稳定抢在 CP 续播之前拿到控制权。
+//
+// 只对能解析出真实时长的 .mp3 生效（DurationMs>0）；其他格式/在线直链没有这个保护，
+// 完全依赖 Idle 事件本身。
+type PlayerConfig struct {
+	// WatchdogEnabled 是否启用上述主动续播机制，默认开启。
+	WatchdogEnabled *bool `yaml:"watchdog_enabled,omitempty"`
+
+	// PreemptMarginSec 提前多少秒（在预估时长结束前）主动切到下一首。
+	// 默认 2 秒；下限 1 秒，上限不超过这首歌真实时长的 20%（避免估算误差导致砍掉太多内容）。
+	PreemptMarginSec *int `yaml:"preempt_margin_sec,omitempty"`
+
+	// DiagnosticIntervalSec：播放期间周期性打印 `player_get_context` 原始输出的间隔（秒）。
+	// 纯诊断用途，不影响播放行为，用于持续观察设备端状态、确认上面这套机制是否还在正常
+	// 抢到控制权。默认 15 秒；设为 0 可关闭。
+	DiagnosticIntervalSec *int `yaml:"diagnostic_interval_sec,omitempty"`
 }
 
 // DefaultExtensions 默认支持的音频扩展名
@@ -147,8 +197,24 @@ func (c *MusicConfig) ApplyDefaults() {
 		t := true
 		c.Commands.AbortXiaoAIOnPlay = &t
 	}
+	if c.Commands.AbortHeartbeatIntervalSec == nil {
+		d := 60
+		c.Commands.AbortHeartbeatIntervalSec = &d
+	}
 	if c.HTTP.Port <= 0 {
 		c.HTTP.Port = 18080
+	}
+	if c.Player.WatchdogEnabled == nil {
+		t := true
+		c.Player.WatchdogEnabled = &t
+	}
+	if c.Player.PreemptMarginSec == nil {
+		m := 2
+		c.Player.PreemptMarginSec = &m
+	}
+	if c.Player.DiagnosticIntervalSec == nil {
+		d := 15
+		c.Player.DiagnosticIntervalSec = &d
 	}
 	for i := range c.Stories {
 		if c.Stories[i].EpisodePattern == "" {
