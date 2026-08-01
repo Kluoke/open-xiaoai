@@ -140,8 +140,11 @@ const DefaultEpisodePattern = `第?(\d+)[集回]?`
 var DefaultCommands = CommandsConfig{
 	PlayKeywords:        []string{"播放"},
 	StopKeywords:        []string{"停止播放", "暂停播放", "暂停", "停止", "闭嘴", "别放了", "不要放了", "关机"},
-	NextKeywords:        []string{"下一首", "下一个"},
-	PreviousKeywords:    []string{"上一首", "上一个"},
+	// 覆盖"首/个"（普通音乐语境）和"集/章/回"（故事/有声书按集播放语境）两类说法，
+	// 否则用户在听故事时说"下一集"会因为 matchExact 精确匹配不上"下一首"而被当成
+	// 非音乐指令直接忽略（实测过的真实 bug）。
+	NextKeywords:        []string{"下一首", "下一个", "下一集", "下一章", "下一回", "下集", "换一集"},
+	PreviousKeywords:    []string{"上一首", "上一个", "上一集", "上一章", "上一回", "上集"},
 	RefreshKeywords:     []string{"刷新曲库"},
 	RandomPlayKeywords:  []string{"随便听听"},
 	RepeatOneKeywords:   []string{"单曲循环"},

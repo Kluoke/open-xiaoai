@@ -13,6 +13,21 @@ func TestApplyDefaultsAddsPlaybackControlKeywords(t *testing.T) {
 	assertContains(t, cfg.Commands.ShuffleModeKeywords, "随机播放")
 }
 
+// TestApplyDefaultsAddsEpisodeNextPreviousKeywords 覆盖真实遇到的 bug：故事/有声书场景下
+// 用户说"下一集"/"上一集"（而不是"下一首"/"上一首"），matchExact 是精确匹配，如果默认
+// 关键词只有"首/个"这一类说法，"下一集"会被当成非音乐指令直接忽略，导致喊了没反应。
+func TestApplyDefaultsAddsEpisodeNextPreviousKeywords(t *testing.T) {
+	var cfg MusicConfig
+	cfg.ApplyDefaults()
+
+	assertContains(t, cfg.Commands.NextKeywords, "下一集")
+	assertContains(t, cfg.Commands.NextKeywords, "下一章")
+	assertContains(t, cfg.Commands.NextKeywords, "下集")
+	assertContains(t, cfg.Commands.PreviousKeywords, "上一集")
+	assertContains(t, cfg.Commands.PreviousKeywords, "上一章")
+	assertContains(t, cfg.Commands.PreviousKeywords, "上集")
+}
+
 func TestApplyDefaultsAddsLXDefaults(t *testing.T) {
 	var cfg MusicConfig
 	cfg.ApplyDefaults()
