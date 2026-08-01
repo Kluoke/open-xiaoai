@@ -108,6 +108,9 @@ type SongItem struct {
 	// 用于主动续播机制判断"这首歌是不是快播完了"；0 表示未知（比如 LX 在线直链、非 mp3、
 	// 解析失败），此时主动续播对这首歌不生效，完全依赖真正的 Idle 事件。
 	DurationMs int64
+	// Episode 集数，来自 IndexedSong.Episode，0 表示非分集内容（普通音乐/在线歌曲）。
+	// 用于播放前播报"现在播放第 X 集"，方便小朋友知道当前进度、中断后也能知道听到第几集了。
+	Episode int
 }
 
 // Player 播放器：队列、RPC 调用、Idle 切歌
@@ -476,21 +479,44 @@ func (p *Player) SetQueue(items []SongItem) bool {
 	if len(p.queue) == 0 {
 		return false
 	}
-	return p.playNextLocked(false)
+	// announce=false：这一批的第一首如果是按集播放，调用方（module.go handlePlay）已经
+	// 用 "好的，找到 X 集，从第 X 集开始播放" 报过起始集数了，这里不用再重复播报。
+	return p.playNextLocked(false, false)
 }
 
 // playNextLocked 播放下一首（调用方需已持锁）
-func (p *Player) playNextLocked(recordHistory bool) bool {
+//
+// announce 控制是否在播放前先播报"现在播放第 X 集"（仅对 Episode>0 的分集内容生效）。
+// 见 playItemLocked 的 announce 参数注释。
+func (p *Player) playNextLocked(recordHistory, announce bool) bool {
 	if len(p.queue) == 0 {
 		p.currentSong = nil
 		return false
 	}
 	item := p.queue[0]
 	p.queue = p.queue[1:]
-	return p.playItemLocked(item, recordHistory)
+	return p.playItemLocked(item, recordHistory, announce)
 }
 
-func (p *Player) playItemLocked(item SongItem, recordHistory bool) bool {
+// playItemLocked 播放指定项（调用方需已持锁）。
+//
+// announce：是否在真正下发 PlayURL 之前先用 Speak 播报"现在播放第 X 集"（仅当
+// item.Episode>0 才会真的说话，普通音乐/在线歌曲 Episode=0 不受影响）。
+//
+// 为什么需要这个播报、为什么调用方要按场景传不同的值：
+//   - 故事/有声书按集播放时，如果不播报集数，小朋友没法知道当前听到第几集，
+//     一旦播放中断（比如设备重启、被别的指令打断），也无从得知该从哪一集继续听。
+//   - handlePlay 用户主动点播的第一首，已经在 module.go 里用
+//     "好的，找到 X 集，从第 X 集开始播放" 报过起始集数了，这里再报一遍会显得啰嗦，
+//     所以调用方传 announce=false 跳过。
+//   - 后续每次切到新的一集（自动播完切下一集、用户说"下一集"/"上一集"、队列耗尽后
+//     自动续播下一批），调用方都传 announce=true，确保每一集开始前都能听到"现在播放
+//     第 X 集"。
+//   - 单曲循环重播当前这一集时，因为是同一集重复播放，不需要再报一次，传 announce=false。
+//
+// Speak 是阻塞调用（同步等 tts_play.sh 播完），必须在 PlayURL 之前完成，这样才能保证
+// "先说第几集，再播放音频"的顺序，不会被后续的歌声打断或抢跑。
+func (p *Player) playItemLocked(item SongItem, recordHistory, announce bool) bool {
 	if recordHistory && p.currentSong != nil {
 		p.history = append(p.history, *p.currentSong)
 	}
@@ -504,6 +530,10 @@ func (p *Player) playItemLocked(item SongItem, recordHistory bool) bool {
 	queueLen := len(p.queue)
 	histLen := len(p.history)
 	p.mu.Unlock()
+	if announce && item.Episode > 0 {
+		// 播报必须先于 PlayURL 且同步等待播完，保证小朋友先听到"第几集"，再听到正文内容。
+		_ = p.Speak(fmt.Sprintf("现在播放第%d集", item.Episode))
+	}
 	err := p.PlayURL(item.URL)
 	p.mu.Lock()
 	if err != nil {
@@ -616,7 +646,8 @@ func (p *Player) Next() bool {
 
 func (p *Player) nextLocked(recordHistory bool) bool {
 	if len(p.queue) > 0 {
-		return p.playNextLocked(recordHistory)
+		// announce=true：切到队列里的下一项，如果它是分集内容就播报"现在播放第 X 集"。
+		return p.playNextLocked(recordHistory, true)
 	}
 	switch p.mode {
 	case PlaybackModeRepeatAll, PlaybackModeShuffle:
@@ -633,12 +664,12 @@ func (p *Player) nextLocked(recordHistory bool) bool {
 		} else {
 			log.Printf("➡️ [music/player] 列表循环: 重新填充 %d 首", len(p.queue))
 		}
-		return p.playNextLocked(recordHistory)
+		return p.playNextLocked(recordHistory, true)
 	default:
 		if more := p.tryFetchMoreLocked(); len(more) > 0 {
 			p.queue = more
 			p.playlist = copySongItems(more)
-			return p.playNextLocked(recordHistory)
+			return p.playNextLocked(recordHistory, true)
 		}
 		log.Printf("➡️ [music/player] 队列耗尽 (mode=sequence)，停止")
 		return false
@@ -672,7 +703,8 @@ func (p *Player) Previous() bool {
 	if p.currentSong != nil {
 		p.queue = append([]SongItem{*p.currentSong}, p.queue...)
 	}
-	return p.playItemLocked(prev, false)
+	// announce=true：Previous 切到的是不同的一集，需要播报。
+	return p.playItemLocked(prev, false, true)
 }
 
 func (p *Player) SetMode(mode PlaybackMode) {
@@ -704,7 +736,8 @@ func (p *Player) replayCurrentLocked() bool {
 	if p.currentSong == nil {
 		return false
 	}
-	return p.playItemLocked(*p.currentSong, false)
+	// announce=false：单曲循环重播的是同一集，不需要重复播报。
+	return p.playItemLocked(*p.currentSong, false, false)
 }
 
 // CurrentState 返回当前播放状态
@@ -728,7 +761,7 @@ func (p *Player) BuildQueueFromSongs(songs []IndexedSong) []SongItem {
 		p.fileServer.AllowFile(s.Path)
 		url := p.fileServer.CreateFileURL(s.Path)
 		if url != "" {
-			items = append(items, SongItem{Path: s.Path, URL: url, Size: s.Size, DurationMs: s.DurationMs})
+			items = append(items, SongItem{Path: s.Path, URL: url, Size: s.Size, DurationMs: s.DurationMs, Episode: s.Episode})
 		} else {
 			skipped++
 			log.Printf("⚠️ [music/player] BuildQueue 跳过 (URL 生成失败): %s", s.Path)

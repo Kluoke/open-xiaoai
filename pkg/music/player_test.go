@@ -172,6 +172,77 @@ func TestPlayerShuffleModeContinuesAfterQueueEnds(t *testing.T) {
 	}
 }
 
+// TestAnnounceEpisodeBeforePlayback 覆盖"播放前先播报第几集"的核心需求：
+//   - 第一集（由 SetQueue 播放）不重复播报（module.go 的 handlePlay 已经用反馈语报过了）；
+//   - 自动切到下一集（Idle 触发）、用户手动 Next/Previous 都应该在真正 PlayURL 之前先
+//     Speak "现在播放第 X 集"，且顺序必须是先说完集数、再播放音频。
+func TestAnnounceEpisodeBeforePlayback(t *testing.T) {
+	p, played := newTestPlayer(t)
+	var spoken []string
+	var order []string
+	p.speak = func(text string) error {
+		spoken = append(spoken, text)
+		order = append(order, "speak:"+text)
+		return nil
+	}
+	// 覆盖 playURL 记录顺序，验证"先说集数、再播放"的时序。
+	p.playURL = func(url string) error {
+		*played = append(*played, url)
+		order = append(order, "play:"+url)
+		p.lastPlayURLAt = time.Now().Add(-playGracePeriod)
+		return nil
+	}
+
+	items := []SongItem{
+		{Path: "ep1.mp3", URL: "http://music/ep1.mp3", Episode: 1},
+		{Path: "ep2.mp3", URL: "http://music/ep2.mp3", Episode: 2},
+	}
+	p.SetQueue(items)
+	if len(spoken) != 0 {
+		t.Fatalf("expected no episode announcement for the first item played via SetQueue, got %v", spoken)
+	}
+
+	p.OnPlayingStatus("Playing")
+	p.OnPlayingStatus("Idle") // 自动切到第 2 集
+
+	if len(spoken) != 1 || spoken[0] != "现在播放第2集" {
+		t.Fatalf("expected announcement for episode 2 on auto-advance, got %v", spoken)
+	}
+	wantOrder := []string{"play:http://music/ep1.mp3", "speak:现在播放第2集", "play:http://music/ep2.mp3"}
+	if len(order) != len(wantOrder) {
+		t.Fatalf("expected order %v, got %v", wantOrder, order)
+	}
+	for i := range wantOrder {
+		if order[i] != wantOrder[i] {
+			t.Fatalf("expected speak-before-play order %v, got %v", wantOrder, order)
+		}
+	}
+
+	if !p.Previous() {
+		t.Fatal("expected previous to succeed")
+	}
+	if len(spoken) != 2 || spoken[1] != "现在播放第1集" {
+		t.Fatalf("expected announcement for episode 1 on manual Previous, got %v", spoken)
+	}
+}
+
+// TestAnnounceEpisodeSkippedForNonEpisodeContent 普通音乐/在线歌曲 Episode=0，
+// 不应该触发"现在播放第 X 集"播报。
+func TestAnnounceEpisodeSkippedForNonEpisodeContent(t *testing.T) {
+	p, _ := newTestPlayer(t)
+	var spoken []string
+	p.speak = func(text string) error {
+		spoken = append(spoken, text)
+		return nil
+	}
+	p.SetQueue(testItems()) // Episode 均为 0
+	p.OnPlayingStatus("Playing")
+	p.OnPlayingStatus("Idle")
+	if len(spoken) != 0 {
+		t.Fatalf("expected no episode announcement for non-episode content, got %v", spoken)
+	}
+}
+
 // TestExhaustedHandlerFetchesMoreWhenQueueEmpties 覆盖故事/按集播放的自动续播场景：
 // 队列播完（顺序模式，没有循环）时，如果设置了 onExhausted 回调，应该调用它拉取下一批
 // 并接着播放，而不是直接停止。
