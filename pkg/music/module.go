@@ -89,7 +89,14 @@ func (m *Module) Start(ctx context.Context) error {
 	if m.config.Player.PreemptMarginSec != nil {
 		preemptMarginSec = *m.config.Player.PreemptMarginSec
 	}
-	m.player = NewPlayer(m.fileSrv, m.indexer, WithWatchdog(watchdogEnabled), WithPreemptMargin(preemptMarginSec))
+	announceEpisode := m.config.Player.AnnounceEpisodeBeforePlay == nil || *m.config.Player.AnnounceEpisodeBeforePlay
+	m.player = NewPlayer(
+		m.fileSrv,
+		m.indexer,
+		WithWatchdog(watchdogEnabled),
+		WithPreemptMargin(preemptMarginSec),
+		WithEpisodeAnnouncement(announceEpisode),
+	)
 
 	// 先尝试加载磁盘缓存，让 Start 立刻就能用到已有曲库。
 	// 增量 Refresh 移到后台异步执行（10k+ FLAC 元数据可能需要几秒），
@@ -492,17 +499,16 @@ func (m *Module) handlePlay(keyword string) bool {
 	items := m.player.BuildQueueFromSongs(songs)
 	log.Printf("🎵 [music] 构建队列: %d 首 (过滤后)", len(items))
 
-	// 时序：AbortXiaoAI → Speak → SetQueue
+	// 时序：Speak → AbortXiaoAI → SetQueue
 	//
-	// 1) AbortXiaoAI（同步）：/etc/init.d/mico_aivs_lab restart
+	// 1) Speak（同步阻塞 3-5s）：tts_play.sh 反馈语
+	//
+	// 2) AbortXiaoAI（同步）：/etc/init.d/mico_aivs_lab restart
 	//    - 把小爱云端 NLP/TTS 流水线整个杀掉，云端就不会再返回试听版抢占 mediaplayer
-	//    - restart 命令本身很快（几十 ms），不显式 sleep
-	//
-	// 2) Speak（同步阻塞 3-5s）：tts_play.sh 反馈语
+	//    - 放在 Speak 后是为了避免“刚重启完服务还没就绪，tts_play.sh 偶发失败”
 	//
 	// 3) SetQueue → PlayURL：切到本地 URL
-
-	m.maybeAbortXiaoAI()
+	//
 
 	feedback := fmt.Sprintf("好的，找到%d首歌曲", len(items))
 	if intent.Episode > 0 {
@@ -512,6 +518,7 @@ func (m *Module) handlePlay(keyword string) bool {
 	}
 
 	_ = m.player.Speak(feedback)
+	m.maybeAbortXiaoAI()
 
 	// 故事/按集播放：设置续播回调，这一批 20 集放完后自动拉取下一批（21~40 集……），
 	// 不需要把 search.max_results 开得很大去一次性入队整季（那样会连带影响普通音乐
@@ -784,10 +791,9 @@ func (m *Module) handleRandomPlay(text string) bool {
 
 	// 在 Speak 之前打断云端：云端识别"随便听听"后会推自己那套随机清单
 	// 给 mediaplayer，导致本地播完一首后被云端 PlayList 的下一项抢占。
-	m.maybeAbortXiaoAI()
-
 	m.player.StopTTS()
 	m.player.Speak(fmt.Sprintf("好的，随机播放%d首歌曲", len(items)))
+	m.maybeAbortXiaoAI()
 	m.player.SetExhaustedHandler(nil)
 	m.player.SetQueue(items)
 	return true

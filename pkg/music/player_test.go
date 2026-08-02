@@ -2,6 +2,7 @@ package music
 
 import (
 	"context"
+	"errors"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -118,6 +119,37 @@ func TestOnPlayingStatusStillAdvancesOnGenuineCompletion(t *testing.T) {
 	}
 }
 
+// TestOnPlayingStatusEarlyIdleStillAdvancesForEpisodeContent 覆盖线上回归：
+// 故事/有声书（Episode>0）在设备偶发早期 Idle 时，不应该被"手动暂停兜底"拦住，
+// 否则会卡在当前集，表现成"播了几集后不自动续播"。
+func TestOnPlayingStatusEarlyIdleStillAdvancesForEpisodeContent(t *testing.T) {
+	p, played := newTestPlayer(t)
+	p.speak = func(text string) error { return nil }
+	items := []SongItem{
+		{Path: "ep93.mp3", URL: "http://music/ep93.mp3", DurationMs: 280_000, Episode: 93},
+		{Path: "ep94.mp3", URL: "http://music/ep94.mp3", DurationMs: 280_000, Episode: 94},
+	}
+	p.SetQueue(items)
+	if len(*played) != 1 {
+		t.Fatalf("expected first episode to start, played=%v", *played)
+	}
+
+	// 模拟设备在 21 秒就上报 Idle（远小于 280s 的 70%）。对于 Episode>0，
+	// 仍应按自然播完处理并切到下一集，而不是误判成手动暂停。
+	p.mu.Lock()
+	p.lastPlayURLAt = time.Now().Add(-21 * time.Second)
+	p.mu.Unlock()
+	p.OnPlayingStatus("Playing")
+	p.OnPlayingStatus("Idle")
+
+	if len(*played) != 2 {
+		t.Fatalf("expected episode content to continue on early idle, played=%v", *played)
+	}
+	if (*played)[1] != "http://music/ep94.mp3" {
+		t.Fatalf("expected to advance to next episode, got %s", (*played)[1])
+	}
+}
+
 func TestPlayerRepeatOneManualNextStillAdvances(t *testing.T) {
 	// 单曲循环只影响自动 Idle，用户手动 "下一首" 仍然要跳出当前曲，
 	// 跟 iTunes / Spotify / Apple Music 一致。
@@ -157,6 +189,32 @@ func TestPlayerRepeatAllLoopsPlaylistOnIdle(t *testing.T) {
 		if (*played)[i] != want[i] {
 			t.Fatalf("expected %v, got %v", want, *played)
 		}
+	}
+}
+
+// TestStateRemainsPlayingAfterAutoAdvance 覆盖一个关键状态一致性：
+// OnPlayingStatus("Idle") 触发自动切歌且成功后，state 必须保持 Playing。
+// 否则后续依赖 state==Playing 的心跳/看门狗会误判为空闲，导致停摆。
+func TestStateRemainsPlayingAfterAutoAdvance(t *testing.T) {
+	p, _ := newTestPlayer(t)
+	p.SetQueue(testItems()[:2])
+	p.OnPlayingStatus("Playing")
+	p.OnPlayingStatus("Idle")
+
+	if got := p.CurrentState(); got != StatePlaying {
+		t.Fatalf("expected state playing after successful auto-advance, got %d", got)
+	}
+}
+
+// TestStateBecomesIdleWhenQueueExhausted 自动切歌失败（队列耗尽）时才应该回到 Idle。
+func TestStateBecomesIdleWhenQueueExhausted(t *testing.T) {
+	p, _ := newTestPlayer(t)
+	p.SetQueue(testItems()[:1])
+	p.OnPlayingStatus("Playing")
+	p.OnPlayingStatus("Idle")
+
+	if got := p.CurrentState(); got != StateIdle {
+		t.Fatalf("expected state idle when queue exhausted, got %d", got)
 	}
 }
 
@@ -240,6 +298,88 @@ func TestAnnounceEpisodeSkippedForNonEpisodeContent(t *testing.T) {
 	p.OnPlayingStatus("Idle")
 	if len(spoken) != 0 {
 		t.Fatalf("expected no episode announcement for non-episode content, got %v", spoken)
+	}
+}
+
+func TestEpisodeAnnouncementCanBeDisabled(t *testing.T) {
+	p, played := newTestPlayer(t)
+	p.announceEpisodeBeforePlay = false
+	var spoken []string
+	p.speak = func(text string) error {
+		spoken = append(spoken, text)
+		return nil
+	}
+	items := []SongItem{
+		{Path: "ep10.mp3", URL: "http://music/ep10.mp3", Episode: 10},
+		{Path: "ep11.mp3", URL: "http://music/ep11.mp3", Episode: 11},
+	}
+	p.SetQueue(items)
+	p.OnPlayingStatus("Playing")
+	p.OnPlayingStatus("Idle")
+
+	if len(*played) != 2 {
+		t.Fatalf("expected queue to auto-advance, played=%v", *played)
+	}
+	if len(spoken) != 0 {
+		t.Fatalf("expected no episode announcement when disabled, got %v", spoken)
+	}
+}
+
+func TestPlayItemWaitsForSpeakBeforePlayURL(t *testing.T) {
+	p, played := newTestPlayer(t)
+	done := make(chan struct{})
+	p.speak = func(text string) error {
+		time.Sleep(40 * time.Millisecond)
+		close(done)
+		return nil
+	}
+	items := []SongItem{
+		{Path: "ep1.mp3", URL: "http://music/ep1.mp3", Episode: 1},
+		{Path: "ep2.mp3", URL: "http://music/ep2.mp3", Episode: 2},
+	}
+	p.SetQueue(items)
+	p.OnPlayingStatus("Playing")
+	p.OnPlayingStatus("Idle")
+
+	select {
+	case <-done:
+	case <-time.After(300 * time.Millisecond):
+		t.Fatal("expected Speak to complete before advancing playback")
+	}
+	if len(*played) != 2 || (*played)[1] != "http://music/ep2.mp3" {
+		t.Fatalf("expected playback to advance to episode 2, played=%v", *played)
+	}
+}
+
+func TestPlayItemStillPlaysWhenSpeakFails(t *testing.T) {
+	p, played := newTestPlayer(t)
+	p.speak = func(text string) error {
+		return errors.New("tts down")
+	}
+	items := []SongItem{
+		{Path: "ep1.mp3", URL: "http://music/ep1.mp3", Episode: 1},
+		{Path: "ep2.mp3", URL: "http://music/ep2.mp3", Episode: 2},
+	}
+	p.SetQueue(items)
+	p.OnPlayingStatus("Playing")
+	p.OnPlayingStatus("Idle")
+
+	if len(*played) != 2 {
+		t.Fatalf("expected playback to continue even when Speak fails, played=%v", *played)
+	}
+}
+
+func TestTreatSpeakExitAsSuccessWhenMyLogMissingButPlaybackCompleted(t *testing.T) {
+	stderr := "/usr/sbin/tts_play.sh: line 1: my_log: not found\n...\nevent(EndReached) is posted\n"
+	if !treatSpeakExitAsSuccess("", stderr, 2*time.Second) {
+		t.Fatal("expected non-zero speak to be treated as success when playback completed")
+	}
+}
+
+func TestTreatSpeakExitAsSuccessReturnsFalseForHardFailure(t *testing.T) {
+	stderr := "miplayer: option requires an argument -- 'f'"
+	if treatSpeakExitAsSuccess("", stderr, 100*time.Millisecond) {
+		t.Fatal("expected hard failure not to be treated as success")
 	}
 }
 

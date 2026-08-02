@@ -53,6 +53,9 @@ func TestApplyDefaultsAddsPlayerDiagnosticDefaults(t *testing.T) {
 	if cfg.Player.DiagnosticIntervalSec == nil || *cfg.Player.DiagnosticIntervalSec != 0 {
 		t.Fatalf("expected diagnostic interval disabled (0) by default, got %+v", cfg.Player.DiagnosticIntervalSec)
 	}
+	if cfg.Player.AnnounceEpisodeBeforePlay == nil || !*cfg.Player.AnnounceEpisodeBeforePlay {
+		t.Fatalf("expected announce_episode_before_play enabled by default, got %+v", cfg.Player.AnnounceEpisodeBeforePlay)
+	}
 }
 
 func TestApplyDefaultsAddsPlayerWatchdogDefaults(t *testing.T) {

@@ -128,6 +128,11 @@ type PlayerConfig struct {
 	// 是否复现。默认**关闭**（0）——已经用它定位到根因（喜马拉雅 CP 续播），日常运行不需要
 	// 一直开着刷日志；需要继续排查时随时可以打开，比如设成 15 秒。
 	DiagnosticIntervalSec *int `yaml:"diagnostic_interval_sec,omitempty"`
+
+	// AnnounceEpisodeBeforePlay 是否在每次切到新一集前播报“现在播放第X集”。
+	// 默认开启（true）：方便小朋友知道当前进度、中断后能知道听到第几集。
+	// 设为 false 可关闭这段播报，直接播放音频内容。
+	AnnounceEpisodeBeforePlay *bool `yaml:"announce_episode_before_play,omitempty"`
 }
 
 // DefaultExtensions 默认支持的音频扩展名
@@ -232,6 +237,10 @@ func (c *MusicConfig) ApplyDefaults() {
 	if c.Player.DiagnosticIntervalSec == nil {
 		d := 0
 		c.Player.DiagnosticIntervalSec = &d
+	}
+	if c.Player.AnnounceEpisodeBeforePlay == nil {
+		t := true
+		c.Player.AnnounceEpisodeBeforePlay = &t
 	}
 	for i := range c.Stories {
 		if c.Stories[i].EpisodePattern == "" {

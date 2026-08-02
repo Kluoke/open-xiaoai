@@ -90,6 +90,16 @@ const (
 	// 这期间收到的 Idle 仍可能是恢复过程中的瞬态。
 	speakSuppressTail = 3 * time.Second
 
+	// 有些设备固件上的 tts_play.sh 会很快返回（甚至<100ms），但声音实际上还没真正播出来，
+	// 紧接着下发 PlayURL 会把这句提示直接抢断，用户就听不到“现在播放第X集”。
+	// 这里给一个最小阻塞时长兜底，保证“先播报，再播放正文”在时序上成立。
+	minSpeakBlocking = 1500 * time.Millisecond
+
+	// AbortXiaoAI 会重启 mico_aivs_lab，重启后的短窗口里 tts_play.sh 偶发失败
+	// （如 Failed to parse message data / miplayer -f 缺参）。失败后稍等再重试一次，
+	// 覆盖"服务刚起来还没就绪"的情况。
+	speakRetryDelay = 1200 * time.Millisecond
+
 	// earlyIdleThresholdRatio 用于区分"歌曲自然播完"和"用户手动暂停/停止"（比如按了设备
 	// 物理暂停键）：如果距上次 PlayURL 的时间占这首歌真实时长的比例低于这个值，判定为
 	// 手动打断，不自动切下一首。0.7 留了比较大的容错空间（应对 CBR 估算误差、VBR 文件等），
@@ -150,6 +160,10 @@ type Player struct {
 	// 获取 p.mu 的方法（会死锁）——只应该是纯查询（比如调 Indexer.SearchEpisode），不碰 Player 状态。
 	onExhausted func() []SongItem
 
+	// announceEpisodeBeforePlay 控制是否在播放分集内容（Episode>0）前播报
+	// "现在播放第X集"。
+	announceEpisodeBeforePlay bool
+
 	// initialStateCh 在收到第一个 playing 事件时关闭，用来给上层"等一下首个状态"的能力，
 	// 取代之前注释里建议的 Sleep 推断（不可靠）。
 	initialStateCh   chan struct{}
@@ -164,6 +178,7 @@ func NewPlayer(fs *FileServer, idx *Indexer, opts ...PlayerOption) *Player {
 		initialStateCh:  make(chan struct{}),
 		watchdogEnabled: true,
 		preemptMargin:   defaultPreemptMargin,
+		announceEpisodeBeforePlay: true,
 	}
 	for _, opt := range opts {
 		opt(p)
@@ -189,6 +204,13 @@ func WithPreemptMargin(seconds int) PlayerOption {
 		if seconds > 0 {
 			p.preemptMargin = time.Duration(seconds) * time.Second
 		}
+	}
+}
+
+// WithEpisodeAnnouncement 配置是否在每次播放分集内容前播报“现在播放第X集”。
+func WithEpisodeAnnouncement(enabled bool) PlayerOption {
+	return func(p *Player) {
+		p.announceEpisodeBeforePlay = enabled
 	}
 }
 
@@ -311,6 +333,32 @@ func shellEscapeSingle(s string) string {
 	return strings.ReplaceAll(s, "'", `'\''`)
 }
 
+func summarizeShellText(s string) string {
+	s = strings.TrimSpace(s)
+	if s == "" {
+		return ""
+	}
+	if len(s) > 240 {
+		return s[:240] + "...(trunc)"
+	}
+	return s
+}
+
+// treatSpeakExitAsSuccess 判断 tts_play.sh 的非零退出是否可视为“已实际播报成功”。
+// 某些机型上会出现 "my_log: not found" + exit=1，但实际已经把 TTS 播放完。
+func treatSpeakExitAsSuccess(stdout, stderr string, elapsed time.Duration) bool {
+	if !strings.Contains(stderr, "my_log: not found") {
+		return false
+	}
+	if strings.Contains(stderr, "event(EndReached) is posted") {
+		return true
+	}
+	if strings.Contains(stdout, "/tmp/tts/tts_") && elapsed >= time.Second {
+		return true
+	}
+	return false
+}
+
 // Speak 播报反馈语
 // 用 /usr/sbin/tts_play.sh：保证用户能听到（ubus mibrain 会被云端 TTS 路由，配置不当时静默不出声）。
 //
@@ -337,9 +385,40 @@ func (p *Player) Speak(text string) error {
 	script := fmt.Sprintf(`/usr/sbin/tts_play.sh '%s'`, shellEscapeSingle(text))
 	// 超时给得宽裕一些：常见反馈语 1-5 秒；超过 15 秒说明设备端 tts 卡死，及时 bail 出
 	timeout := uint64(15000)
-	_, err := connect.GetRPC().CallRemote("run_shell", script, &timeout)
+	runSpeakOnce := func() (time.Duration, error) {
+		start := time.Now()
+		resp, err := connect.GetRPC().CallRemote("run_shell", script, &timeout)
+		elapsed := time.Since(start)
+		if err != nil {
+			log.Printf("❌ [music/player] Speak RPC 失败: %v", err)
+			return elapsed, err
+		}
+		r := decodeShellResult(resp)
+		log.Printf("📝 [music/player] Speak ubus 返回: %s (耗时=%v)",
+			briefShellResult(r), elapsed.Round(time.Millisecond))
+		if r != nil && r.ExitCode != 0 {
+			stderr := strings.TrimSpace(r.Stderr)
+			if treatSpeakExitAsSuccess(r.Stdout, stderr, elapsed) {
+				log.Printf("⚠️ [music/player] Speak 返回非零但判定为已成功播报: exit=%d stderr=%q (耗时=%v)",
+					r.ExitCode, summarizeShellText(stderr), elapsed.Round(time.Millisecond))
+				return elapsed, nil
+			}
+			err = fmt.Errorf("tts_play.sh exit=%d stderr=%s", r.ExitCode, summarizeShellText(stderr))
+			log.Printf("❌ [music/player] Speak 设备端非零退出: exit=%d stderr=%q", r.ExitCode, summarizeShellText(stderr))
+			return elapsed, err
+		}
+		return elapsed, nil
+	}
+
+	elapsed, err := runSpeakOnce()
 	if err != nil {
-		log.Printf("❌ [music/player] Speak RPC 失败: %v", err)
+		log.Printf("📝 [music/player] Speak 首次失败，%v 后重试一次", speakRetryDelay)
+		time.Sleep(speakRetryDelay)
+		elapsed, err = runSpeakOnce()
+	}
+
+	if err == nil && elapsed < minSpeakBlocking {
+		time.Sleep(minSpeakBlocking - elapsed)
 	}
 
 	// Speak 返回后再延一会儿：mphelper play 恢复 mediaplayer 状态需要时间
@@ -530,7 +609,7 @@ func (p *Player) playItemLocked(item SongItem, recordHistory, announce bool) boo
 	queueLen := len(p.queue)
 	histLen := len(p.history)
 	p.mu.Unlock()
-	if announce && item.Episode > 0 {
+	if announce && p.announceEpisodeBeforePlay && item.Episode > 0 {
 		// 播报必须先于 PlayURL 且同步等待播完，保证小朋友先听到"第几集"，再听到正文内容。
 		_ = p.Speak(fmt.Sprintf("现在播放第%d集", item.Episode))
 	}
@@ -599,7 +678,12 @@ func (p *Player) OnPlayingStatus(status string) {
 			// 形同虚设。用已经解析出的真实时长（IndexedSong.DurationMs）做个兜底判断：
 			// 如果距上次 PlayURL 的时间远小于这首歌真实应该播放的时长，大概率不是"自然播完"，
 			// 而是用户手动打断了播放，这种情况下不应该自动切下一首，老老实实停在这里。
-			if p.currentSong.DurationMs > 0 {
+			//
+			// 但这个保护只对普通音乐（Episode=0）启用：
+			// 故事/有声书按集播放（Episode>0）里，设备偶发的早期 Idle（并非用户真的要暂停）
+			// 更常见，若在这里直接判定"手动暂停"会导致队列卡死在某一集，表现为"播了几集后不
+			// 自动续播"。对分集内容优先保证连续播放，早期 Idle 仍然按自然播完去续下一集。
+			if p.currentSong.DurationMs > 0 && p.currentSong.Episode <= 0 {
 				expected := time.Duration(p.currentSong.DurationMs) * time.Millisecond
 				since := now.Sub(p.lastPlayURLAt)
 				if since < time.Duration(float64(expected)*earlyIdleThresholdRatio) {
@@ -612,12 +696,23 @@ func (p *Player) OnPlayingStatus(status string) {
 			}
 		}
 		log.Printf("🎚️ [music/player] 状态转换 Playing→Idle, 触发自动切歌 (mode=%d)", p.mode)
+		advanced := false
 		if p.mode == PlaybackModeRepeatOne {
-			p.replayCurrentLocked()
+			advanced = p.replayCurrentLocked()
 		} else {
-			p.nextLocked(true)
+			advanced = p.nextLocked(true)
 		}
-		p.state = StateIdle
+		if advanced {
+			// 如果已经成功切到下一首，状态应该保持 Playing。
+			// 之前这里无条件写回 Idle，会和上面的切歌结果打架：
+			//   1) nextLocked/playItemLocked 已经把 state 设成 Playing 并开始播下一首；
+			//   2) 但这里又立刻覆盖成 Idle；
+			//   3) 接下来设备上报的 playing=Playing 常常还在 suppress 窗口里，被忽略，
+			//      于是 state 会长期卡在 Idle，导致依赖 state==Playing 的心跳/看门狗停摆。
+			p.state = StatePlaying
+		} else {
+			p.state = StateIdle
+		}
 	case "Playing":
 		if prev != StatePlaying {
 			log.Printf("🎚️ [music/player] 状态转换 %d→Playing", prev)

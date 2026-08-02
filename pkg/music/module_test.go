@@ -16,6 +16,23 @@ type fakeLXResolver struct {
 	err          error
 }
 
+type orderedCalls struct {
+	calls []string
+}
+
+func (o *orderedCalls) add(name string) {
+	o.calls = append(o.calls, name)
+}
+
+func (o *orderedCalls) index(name string) int {
+	for i, v := range o.calls {
+		if v == name {
+			return i
+		}
+	}
+	return -1
+}
+
 func (f *fakeLXResolver) Resolve(ctx context.Context, keyword string) (*LXTrack, error) {
 	f.keyword = keyword
 	return f.track, f.err
@@ -204,5 +221,51 @@ func TestHandlePlaySetsUpEpisodeContinuationAcrossBatches(t *testing.T) {
 	again := player.onExhausted()
 	if len(again) != 0 {
 		t.Fatalf("expected no more episodes after exhausting all 25, got %d", len(again))
+	}
+}
+
+// TestHandlePlaySpeaksBeforeAbortXiaoAI 确认“先播报，再重启 mico_aivs_lab”：
+// 根因是某些设备上 AbortXiaoAI 后短窗口里 tts_play.sh 会报错（服务尚未完全就绪）。
+func TestHandlePlaySpeaksBeforeAbortXiaoAI(t *testing.T) {
+	abort := true
+	cfg := &MusicConfig{
+		Enabled:  true,
+		Dirs:     []string{"/gushi"},
+		Search:   SearchConfig{MaxResults: 5},
+		Commands: CommandsConfig{AbortXiaoAIOnPlay: &abort},
+	}
+	cfg.ApplyDefaults()
+
+	idx := NewIndexer(cfg)
+	idx.songs = []IndexedSong{{Path: "/gushi/001.mp3", NameLower: "测试故事001", Episode: 1}}
+	fileSrv := NewFileServer(&HTTPConfig{Port: 18080, BaseURL: "http://music.local"})
+	player := NewPlayer(fileSrv, idx)
+	order := &orderedCalls{}
+	player.speak = func(text string) error {
+		order.add("speak")
+		return nil
+	}
+	player.abortXiaoAI = func() error {
+		order.add("abort")
+		return nil
+	}
+	player.playURL = func(url string) error {
+		order.add("play")
+		return nil
+	}
+
+	module := &Module{config: cfg, indexer: idx, fileSrv: fileSrv, player: player}
+	if !module.handlePlay("故事测试故事第1集") {
+		t.Fatal("expected handlePlay to succeed")
+	}
+
+	is := order.index("speak")
+	ia := order.index("abort")
+	ip := order.index("play")
+	if is == -1 || ia == -1 || ip == -1 {
+		t.Fatalf("expected speak/abort/play all called, got order=%v", order.calls)
+	}
+	if !(is < ia && ia < ip) {
+		t.Fatalf("expected order speak -> abort -> play, got %v", order.calls)
 	}
 }
