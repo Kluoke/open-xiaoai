@@ -382,17 +382,7 @@ func (p *Player) Speak(text string) error {
 	log.Printf("📝 [music/player] Speak: %q", text)
 	p.extendSuppress(speakSuppressPrefix)
 
-	// 某些设备固件里 tts_play.sh 第一行会调 my_log（一个自定义日志函数），
-	// 但这个命令在部分机型上并未安装，导致 shell "command not found" → exit=1，
-	// TTS 虽然实际播了，但脚本返回错误让我们误以为失败。
-	// 根治方法：在调用前检查 my_log 是否存在，不存在时在 /tmp 注入一个什么也不做的桩脚本，
-	// 再把 /tmp 加到 PATH 最前面，这样 tts_play.sh 就能找到 my_log，exit=0 正常返回。
-	script := fmt.Sprintf(
-		`command -v my_log >/dev/null 2>&1 || `+
-			`{ printf '#!/bin/sh\n' > /tmp/my_log 2>/dev/null && chmod +x /tmp/my_log 2>/dev/null || true; }; `+
-			`PATH=/tmp:$PATH /usr/sbin/tts_play.sh '%s'`,
-		shellEscapeSingle(text),
-	)
+	script := fmt.Sprintf(`/usr/sbin/tts_play.sh '%s'`, shellEscapeSingle(text))
 	// 超时给得宽裕一些：常见反馈语 1-5 秒；超过 15 秒说明设备端 tts 卡死，及时 bail 出
 	timeout := uint64(15000)
 	runSpeakOnce := func() (time.Duration, error) {
