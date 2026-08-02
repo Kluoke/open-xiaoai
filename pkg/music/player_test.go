@@ -376,6 +376,25 @@ func TestTreatSpeakExitAsSuccessWhenMyLogMissingButPlaybackCompleted(t *testing.
 	}
 }
 
+// TestTreatSpeakExitAsSuccessWhenStdoutHasTTSPath 覆盖"my_log 桩脚本已部署"后的场景：
+// stderr 不再有 my_log: not found，但 stdout 有 /tmp/tts/tts_ 路径且耗时足够，
+// 说明 TTS 已播完，不应该重试（否则用户会听到两遍播报）。
+func TestTreatSpeakExitAsSuccessWhenStdoutHasTTSPath(t *testing.T) {
+	stdout := `{"code": 0}` + "\n" + `{ "path": "/tmp/tts/tts_abc123.mp3" }` + "\n/tmp/tts/tts_abc123.mp3"
+	stderr := "libmiplayerlite: player_init: ...\nevent(EndReached) is posted\n"
+	if !treatSpeakExitAsSuccess(stdout, stderr, 2*time.Second) {
+		t.Fatal("expected success when stdout has TTS path and elapsed >= 1s")
+	}
+}
+
+func TestTreatSpeakExitAsSuccessReturnsFalseWhenTooFast(t *testing.T) {
+	// 不到 1 秒就返回 — TTS 根本没播，不能判成功
+	stdout := `{ "path": "/tmp/tts/tts_abc123.mp3" }`
+	if treatSpeakExitAsSuccess(stdout, "", 100*time.Millisecond) {
+		t.Fatal("expected failure when elapsed < 1s even if stdout has TTS path")
+	}
+}
+
 func TestTreatSpeakExitAsSuccessReturnsFalseForHardFailure(t *testing.T) {
 	stderr := "miplayer: option requires an argument -- 'f'"
 	if treatSpeakExitAsSuccess("", stderr, 100*time.Millisecond) {

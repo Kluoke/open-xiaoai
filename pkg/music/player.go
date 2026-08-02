@@ -347,13 +347,16 @@ func summarizeShellText(s string) string {
 // treatSpeakExitAsSuccess 判断 tts_play.sh 的非零退出是否可视为“已实际播报成功”。
 // 某些机型上会出现 "my_log: not found" + exit=1，但实际已经把 TTS 播放完。
 func treatSpeakExitAsSuccess(stdout, stderr string, elapsed time.Duration) bool {
-	if !strings.Contains(stderr, "my_log: not found") {
+	if elapsed < time.Second {
+		// 不到 1 秒就返回，TTS 根本没机会播，按真失败处理
 		return false
 	}
-	if strings.Contains(stderr, "event(EndReached) is posted") {
+	// 主要判据：stdout 有 TTS 文件路径，说明语音合成成功且已播放
+	if strings.Contains(stdout, "/tmp/tts/tts_") {
 		return true
 	}
-	if strings.Contains(stdout, "/tmp/tts/tts_") && elapsed >= time.Second {
+	// 次要判据：libmiplayerlite 播放完成事件
+	if strings.Contains(stderr, "event(EndReached) is posted") {
 		return true
 	}
 	return false
