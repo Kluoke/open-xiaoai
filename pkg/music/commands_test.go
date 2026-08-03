@@ -116,6 +116,31 @@ func TestParsePlayIntentSupportsChineseEpisodeNumerals(t *testing.T) {
 	}
 }
 
+func TestParsePlayIntentEpisodeOnlyReturnsEmptySeries(t *testing.T) {
+	got := ParsePlayIntent("第4集")
+	if got.SeriesName != "" || got.Episode != 4 {
+		t.Fatalf("ParsePlayIntent(第4集) = {%q, %d}, want {\"\", 4}", got.SeriesName, got.Episode)
+	}
+}
+
+func TestParseStoryContextCommand(t *testing.T) {
+	cases := []struct {
+		in   string
+		want StoryContextCommand
+	}{
+		{"默认故事是三国演义第一季", StoryContextCommand{Set: true, SeriesName: "三国演义第一季"}},
+		{"把默认故事设为三国第一季", StoryContextCommand{Set: true, SeriesName: "三国第一季"}},
+		{"当前默认故事是什么", StoryContextCommand{Query: true}},
+		{"清除默认故事", StoryContextCommand{Clear: true}},
+	}
+	for _, c := range cases {
+		got := ParseStoryContextCommand(c.in)
+		if got != c.want {
+			t.Fatalf("ParseStoryContextCommand(%q) = %+v, want %+v", c.in, got, c.want)
+		}
+	}
+}
+
 func TestChineseNumeralToInt(t *testing.T) {
 	cases := map[string]int{
 		"零":     0,

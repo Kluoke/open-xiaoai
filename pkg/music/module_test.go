@@ -224,9 +224,9 @@ func TestHandlePlaySetsUpEpisodeContinuationAcrossBatches(t *testing.T) {
 	}
 }
 
-// TestHandlePlaySpeaksBeforeAbortXiaoAI 确认“先播报，再重启 mico_aivs_lab”：
-// 根因是某些设备上 AbortXiaoAI 后短窗口里 tts_play.sh 会报错（服务尚未完全就绪）。
-func TestHandlePlaySpeaksBeforeAbortXiaoAI(t *testing.T) {
+// TestHandlePlayEpisodeAbortsBeforeSpeak 确认故事/按集播放场景下“先 Abort，再播报”：
+// 目的：避免云端并发语音反馈和本地反馈语重叠（双声道）。
+func TestHandlePlayEpisodeAbortsBeforeSpeak(t *testing.T) {
 	abort := true
 	cfg := &MusicConfig{
 		Enabled:  true,
@@ -265,7 +265,118 @@ func TestHandlePlaySpeaksBeforeAbortXiaoAI(t *testing.T) {
 	if is == -1 || ia == -1 || ip == -1 {
 		t.Fatalf("expected speak/abort/play all called, got order=%v", order.calls)
 	}
+	if !(ia < is && is < ip) {
+		t.Fatalf("expected order abort -> speak -> play, got %v", order.calls)
+	}
+}
+
+// TestHandlePlayNonEpisodeSpeaksBeforeAbortXiaoAI 普通音乐场景保留“先播报，再 Abort”：
+// 避免某些设备上刚重启 mico_aivs_lab 后 tts_play.sh 短窗口不稳定。
+func TestHandlePlayNonEpisodeSpeaksBeforeAbortXiaoAI(t *testing.T) {
+	abort := true
+	cfg := &MusicConfig{
+		Enabled:  true,
+		Dirs:     []string{"/music"},
+		Search:   SearchConfig{MaxResults: 5},
+		Commands: CommandsConfig{AbortXiaoAIOnPlay: &abort},
+	}
+	cfg.ApplyDefaults()
+
+	idx := NewIndexer(cfg)
+	idx.songs = []IndexedSong{{Path: "/music/001.mp3", NameLower: "稻香", Episode: 0}}
+	fileSrv := NewFileServer(&HTTPConfig{Port: 18080, BaseURL: "http://music.local"})
+	player := NewPlayer(fileSrv, idx)
+	order := &orderedCalls{}
+	player.speak = func(text string) error {
+		order.add("speak")
+		return nil
+	}
+	player.abortXiaoAI = func() error {
+		order.add("abort")
+		return nil
+	}
+	player.playURL = func(url string) error {
+		order.add("play")
+		return nil
+	}
+
+	module := &Module{config: cfg, indexer: idx, fileSrv: fileSrv, player: player}
+	if !module.handlePlay("稻香") {
+		t.Fatal("expected handlePlay to succeed")
+	}
+
+	is := order.index("speak")
+	ia := order.index("abort")
+	ip := order.index("play")
+	if is == -1 || ia == -1 || ip == -1 {
+		t.Fatalf("expected speak/abort/play all called, got order=%v", order.calls)
+	}
 	if !(is < ia && ia < ip) {
 		t.Fatalf("expected order speak -> abort -> play, got %v", order.calls)
+	}
+}
+
+func TestHandleStoryContextSetAndQuery(t *testing.T) {
+	abort := false
+	cfg := &MusicConfig{Enabled: true, Commands: CommandsConfig{AbortXiaoAIOnPlay: &abort}}
+	cfg.ApplyDefaults()
+	idx := NewIndexer(cfg)
+	player := NewPlayer(nil, idx)
+	spoken := []string{}
+	player.speak = func(text string) error {
+		spoken = append(spoken, text)
+		return nil
+	}
+	module := &Module{config: cfg, indexer: idx, player: player}
+
+	module.handleStoryContextCommand(StoryContextCommand{Set: true, SeriesName: "三国演义第一季"})
+	module.handleStoryContextCommand(StoryContextCommand{Query: true})
+
+	if module.getDefaultStorySeries() != "三国演义第一季" {
+		t.Fatalf("expected default story to be set")
+	}
+	if len(spoken) != 2 {
+		t.Fatalf("expected 2 speak calls, got %d", len(spoken))
+	}
+	if spoken[0] != "好的，当前默认故事是三国演义第一季" {
+		t.Fatalf("unexpected set feedback: %q", spoken[0])
+	}
+	if spoken[1] != "当前默认故事是三国演义第一季" {
+		t.Fatalf("unexpected query feedback: %q", spoken[1])
+	}
+}
+
+func TestHandlePlayEpisodeUsesDefaultStorySeries(t *testing.T) {
+	abort := false
+	cfg := &MusicConfig{
+		Enabled:  true,
+		Dirs:     []string{"/gushi"},
+		Search:   SearchConfig{MaxResults: 20},
+		Commands: CommandsConfig{AbortXiaoAIOnPlay: &abort},
+	}
+	cfg.ApplyDefaults()
+
+	idx := NewIndexer(cfg)
+	idx.songs = []IndexedSong{
+		{Path: "/gushi/004.mp3", NameLower: "三国演义第一季004", Episode: 4},
+		{Path: "/gushi/005.mp3", NameLower: "三国演义第一季005", Episode: 5},
+	}
+	fileSrv := NewFileServer(&HTTPConfig{Port: 18080, BaseURL: "http://music.local"})
+	played := []string{}
+	player := NewPlayer(fileSrv, idx)
+	player.playURL = func(url string) error {
+		played = append(played, url)
+		return nil
+	}
+	player.speak = func(text string) error { return nil }
+
+	module := &Module{config: cfg, indexer: idx, fileSrv: fileSrv, player: player}
+	module.setDefaultStorySeries("三国演义第一季")
+
+	if !module.handlePlay("第4集") {
+		t.Fatal("expected handlePlay to use default story")
+	}
+	if len(played) != 1 {
+		t.Fatalf("expected first matching episode to play, got %v", played)
 	}
 }

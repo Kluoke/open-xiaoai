@@ -104,6 +104,26 @@ type PlayIntent struct {
 	// 避免和普通"播放音乐"混在一起。
 }
 
+// StoryContextCommand 默认故事上下文命令。
+// 用于"默认故事是三国演义第一季"、"默认故事是什么"等口令。
+type StoryContextCommand struct {
+	Set        bool
+	Clear      bool
+	Query      bool
+	SeriesName string
+}
+
+// setDefaultStoryRegex 解析"设置默认故事"类命令（基于去空格后的文本匹配）。
+// 支持示例：
+// - 默认故事是三国演义第一季
+// - 默认故事设为三国演义第一季
+// - 设置默认故事三国演义第一季
+// - 把默认故事设为三国演义第一季
+var setDefaultStoryRegex = regexp.MustCompile(`^(?:设置)?默认故事(?:是|为|设为)?(.+)$|^把默认故事设为(.+)$`)
+
+var queryDefaultStoryKeywords = []string{"默认故事是什么", "当前默认故事是什么", "默认故事", "当前默认故事"}
+var clearDefaultStoryKeywords = []string{"清除默认故事", "取消默认故事", "删除默认故事", "重置默认故事"}
+
 // episodeRegex 仅匹配带显式集数标记（集/回）的表达：第11集、11集、第11回、水浒传第20集、
 // 第六集、第二十三集 等。集数部分同时兼容阿拉伯数字与中文数字——小爱 ASR 对个位数经常
 // 转写成中文数字（"第六集"）而不是"第6集"，之前只认 \d+ 会导致这类指令 episode 恒为 0。
@@ -132,10 +152,41 @@ func ParsePlayIntent(keyword string) PlayIntent {
 	last := locs[len(locs)-1]
 	epNum := parseEpisodeNumber(norm[last[2]:last[3]])
 	seriesPart := strings.TrimSpace(norm[:last[0]])
-	if seriesPart == "" {
-		seriesPart = cleaned
-	}
 	return PlayIntent{SeriesName: seriesPart, Episode: epNum, IsStory: isStory}
+}
+
+// ParseStoryContextCommand 解析默认故事上下文相关口令。
+func ParseStoryContextCommand(text string) StoryContextCommand {
+	norm := NormalizedForMatch(text)
+	if norm == "" {
+		return StoryContextCommand{}
+	}
+	for _, kw := range clearDefaultStoryKeywords {
+		if norm == NormalizedForMatch(kw) {
+			return StoryContextCommand{Clear: true}
+		}
+	}
+	for _, kw := range queryDefaultStoryKeywords {
+		if norm == NormalizedForMatch(kw) {
+			return StoryContextCommand{Query: true}
+		}
+	}
+	m := setDefaultStoryRegex.FindStringSubmatch(norm)
+	if len(m) == 0 {
+		return StoryContextCommand{}
+	}
+	series := ""
+	if len(m) > 1 {
+		series = m[1]
+	}
+	if series == "" && len(m) > 2 {
+		series = m[2]
+	}
+	series = Normalize(series)
+	if series == "" {
+		return StoryContextCommand{}
+	}
+	return StoryContextCommand{Set: true, SeriesName: series}
 }
 
 // storyResourcePrefixes 故事类资源词：命中后 IsStory=true，强制走"按集搜索"分支，

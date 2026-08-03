@@ -1,6 +1,8 @@
 # pkg/music 模块设计方案
 
-> 可复用的本地音乐播放模块，供 apps/chat、apps/gemini 等集成。纯 Go 实现，无 ffmpeg 依赖，通过监听客户端上报的 `playing` 事件实现自动切歌。
+> ⚠️ 本文档是设计稿（历史文档），实现细节可能与当前代码有差异；配置项、默认值、口令和行为语义请以 [`pkg/music/README.md`](../pkg/music/README.md) 为准。
+>
+> 可复用的本地音乐播放模块，目前主要由 apps/chat 集成。纯 Go 实现，无 ffmpeg 依赖，通过监听客户端上报的 `playing` 事件实现自动切歌。
 
 ---
 

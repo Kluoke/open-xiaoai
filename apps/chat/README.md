@@ -140,7 +140,7 @@ music:
     - /path/to/music
 ```
 
-支持「播放许嵩」「随便听听」「停止播放」等语音指令。连接感知 base_url 已启用，音乐 URL 会根据客户端连接方式（LAN 或 Tailscale）自动选择 host。详见 [connection-aware-base-url-design](../../docs/connection-aware-base-url-design.md)。
+支持「播放许嵩」「随便听听」「停止播放」等语音指令，也支持默认故事上下文（如先说「默认故事是三国演义第一季」，再说「播放第4集」）。连接感知 base_url 已启用，音乐 URL 会根据客户端连接方式（LAN 或 Tailscale）自动选择 host。详见 [connection-aware-base-url-design](../../docs/connection-aware-base-url-design.md)。
 
 通过 `/admin` 修改 `music` 配置并保存后，`apps/chat` 会停止旧的音乐模块并按新配置重新启动；如果只修改监听端口、LLM 或代理配置，仍需重启 `chat`。
 

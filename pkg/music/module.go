@@ -37,6 +37,9 @@ type Module struct {
 	pendingJob func()
 	jobWake    chan struct{}
 	jobWg      sync.WaitGroup
+
+	defaultStoryMu     sync.RWMutex
+	defaultStorySeries string
 }
 
 type lxResolver interface {
@@ -338,6 +341,14 @@ func (m *Module) handleInstruction(event connect.Event) bool {
 // classifyInstruction 把规范化文本映射到一个具体的执行闭包。
 // 返回 nil 表示这条指令不归音乐模块管。优先级：stop > next/previous > modes > refresh > random > play。
 func (m *Module) classifyInstruction(text, normalized string) func() {
+	if cmd := ParseStoryContextCommand(text); cmd.Set || cmd.Query || cmd.Clear {
+		return func() {
+			log.Printf("🎯 [music] 命中默认故事口令: set=%v clear=%v query=%v series=%q",
+				cmd.Set, cmd.Clear, cmd.Query, cmd.SeriesName)
+			m.handleStoryContextCommand(cmd)
+		}
+	}
+
 	switch {
 	case m.matchExact(normalized, m.config.Commands.StopKeywords):
 		return func() {
@@ -463,6 +474,54 @@ func (m *Module) extractPlayKeyword(text string) string {
 	return ""
 }
 
+func (m *Module) handleStoryContextCommand(cmd StoryContextCommand) bool {
+	if cmd.Query {
+		current := m.getDefaultStorySeries()
+		if current == "" {
+			m.player.Speak("当前还没有默认故事")
+		} else {
+			m.player.Speak(fmt.Sprintf("当前默认故事是%s", current))
+		}
+		return true
+	}
+	if cmd.Clear {
+		m.setDefaultStorySeries("")
+		m.player.Speak("好的，已清除默认故事")
+		return true
+	}
+	if cmd.Set {
+		m.setDefaultStorySeries(cmd.SeriesName)
+		m.player.Speak(fmt.Sprintf("好的，当前默认故事是%s", cmd.SeriesName))
+		return true
+	}
+	return false
+}
+
+func (m *Module) setDefaultStorySeries(series string) {
+	m.defaultStoryMu.Lock()
+	m.defaultStorySeries = strings.TrimSpace(series)
+	m.defaultStoryMu.Unlock()
+}
+
+func (m *Module) getDefaultStorySeries() string {
+	m.defaultStoryMu.RLock()
+	defer m.defaultStoryMu.RUnlock()
+	return m.defaultStorySeries
+}
+
+func (m *Module) applyDefaultStoryContext(intent PlayIntent) PlayIntent {
+	if intent.SeriesName != "" || intent.Episode <= 0 {
+		return intent
+	}
+	defaultSeries := m.getDefaultStorySeries()
+	if defaultSeries == "" {
+		return intent
+	}
+	intent.SeriesName = defaultSeries
+	intent.IsStory = true
+	return intent
+}
+
 func (m *Module) handlePlay(keyword string) bool {
 	hasLocalDirs := len(m.config.Dirs) > 0
 	if !hasLocalDirs && m.lx == nil {
@@ -471,6 +530,11 @@ func (m *Module) handlePlay(keyword string) bool {
 		return true
 	}
 	intent := ParsePlayIntent(keyword)
+	intent = m.applyDefaultStoryContext(intent)
+	if intent.SeriesName == "" {
+		m.player.Speak("请告诉我想播放哪个故事或歌曲")
+		return true
+	}
 	useEpisode := intent.Episode > 0 || intent.IsStory || m.matchStory(intent.SeriesName)
 	log.Printf("🎵 [music] handlePlay: keyword=%q intent={series=%q episode=%d isStory=%v} useEpisode=%v",
 		keyword, intent.SeriesName, intent.Episode, intent.IsStory, useEpisode)
@@ -499,13 +563,23 @@ func (m *Module) handlePlay(keyword string) bool {
 	items := m.player.BuildQueueFromSongs(songs)
 	log.Printf("🎵 [music] 构建队列: %d 首 (过滤后)", len(items))
 
-	// 时序：Speak → AbortXiaoAI → SetQueue
+	// 时序：
+	//   - 故事/按集播放：AbortXiaoAI → Speak → SetQueue
+	//   - 普通播放：Speak → AbortXiaoAI → SetQueue
+	//
+	// 故事场景下优先 AbortXiaoAI：
+	// 用户说"播放故事..."时，小爱云端也会并发识别并下发它自己的语音反馈，
+	// 如果先本地 Speak 再 Abort，常见现象就是两路语音重叠（双声道打架）。
+	// 所以故事/按集播放分支先打断云端，再播本地反馈语，避免重叠。
+	//
+	// 普通音乐保留旧顺序（先 Speak 再 Abort）：
+	// 避免某些设备上 "刚重启完服务还没就绪，tts_play.sh 偶发失败" 的窗口。
 	//
 	// 1) Speak（同步阻塞 3-5s）：tts_play.sh 反馈语
 	//
 	// 2) AbortXiaoAI（同步）：/etc/init.d/mico_aivs_lab restart
 	//    - 把小爱云端 NLP/TTS 流水线整个杀掉，云端就不会再返回试听版抢占 mediaplayer
-	//    - 放在 Speak 后是为了避免“刚重启完服务还没就绪，tts_play.sh 偶发失败”
+	//    - 普通播放放在 Speak 后（见上）
 	//
 	// 3) SetQueue → PlayURL：切到本地 URL
 	//
@@ -517,8 +591,13 @@ func (m *Module) handlePlay(keyword string) bool {
 		feedback = fmt.Sprintf("好的，找到%d集", len(items))
 	}
 
-	_ = m.player.Speak(feedback)
-	m.maybeAbortXiaoAI()
+	if useEpisode {
+		m.maybeAbortXiaoAI()
+		_ = m.player.Speak(feedback)
+	} else {
+		_ = m.player.Speak(feedback)
+		m.maybeAbortXiaoAI()
+	}
 
 	// 故事/按集播放：设置续播回调，这一批 20 集放完后自动拉取下一批（21~40 集……），
 	// 不需要把 search.max_results 开得很大去一次性入队整季（那样会连带影响普通音乐
