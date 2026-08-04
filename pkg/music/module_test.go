@@ -380,3 +380,48 @@ func TestHandlePlayEpisodeUsesDefaultStorySeries(t *testing.T) {
 		t.Fatalf("expected first matching episode to play, got %v", played)
 	}
 }
+
+func TestHandleRandomPlayPrefersSongsOutsideStoryDirs(t *testing.T) {
+	abort := false
+	cfg := &MusicConfig{
+		Enabled: true,
+		Dirs:    []string{"/music", "/gushi"},
+		Search:  SearchConfig{MaxResults: 10},
+		Commands: CommandsConfig{
+			AbortXiaoAIOnPlay: &abort,
+		},
+		Stories: []StoryConfig{{Name: "三国演义第一季", Dir: "/gushi/三国演义第1季"}},
+	}
+	cfg.ApplyDefaults()
+
+	idx := NewIndexer(cfg)
+	idx.songs = []IndexedSong{
+		{Path: "/gushi/三国演义第1季/001.mp3", NameLower: "三国001", Episode: 1},
+		{Path: "/gushi/三国演义第1季/002.mp3", NameLower: "三国002", Episode: 2},
+		{Path: "/music/pop/a.mp3", NameLower: "songa", Episode: 0},
+		{Path: "/music/pop/b.mp3", NameLower: "songb", Episode: 0},
+	}
+	fileSrv := NewFileServer(&HTTPConfig{Port: 18080, BaseURL: "http://music.local"})
+	player := NewPlayer(fileSrv, idx)
+	player.speak = func(text string) error { return nil }
+	played := []string{}
+	player.playURL = func(url string) error {
+		played = append(played, url)
+		return nil
+	}
+
+	module := &Module{config: cfg, indexer: idx, fileSrv: fileSrv, player: player}
+	module.setDefaultStorySeries("三国演义第一季")
+
+	if !module.handleRandomPlay("随便听听") {
+		t.Fatal("expected random play to be handled")
+	}
+	if len(played) != 1 {
+		t.Fatalf("expected one item to start playing, got %v", played)
+	}
+	for _, item := range player.playlist {
+		if strings.HasPrefix(item.Path, "/gushi/三国演义第1季/") {
+			t.Fatalf("expected random playlist to exclude story dir, got %+v", player.playlist)
+		}
+	}
+}

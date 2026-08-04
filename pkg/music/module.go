@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"log"
+	"math/rand/v2"
 	"net/url"
 	"os"
 	"path/filepath"
@@ -859,10 +860,15 @@ func (m *Module) handleRandomPlay(text string) bool {
 		m.player.Speak("本地音乐目录还没有配置")
 		return true
 	}
-	songs := m.indexer.Random(m.config.Search.MaxResults)
+	songs, allCount := m.randomSongsForMusic(m.config.Search.MaxResults)
 	if len(songs) == 0 {
-		log.Printf("⚠️ [music] 曲库为空，无法随机播放")
-		m.player.Speak("曲库为空，无法随机播放")
+		if allCount > 0 {
+			log.Printf("⚠️ [music] 曲库里没有可随机播放的歌曲（可能全是故事目录）")
+			m.player.Speak("没有找到可随机播放的歌曲")
+		} else {
+			log.Printf("⚠️ [music] 曲库为空，无法随机播放")
+			m.player.Speak("曲库为空，无法随机播放")
+		}
 		return true
 	}
 	items := m.player.BuildQueueFromSongs(songs)
@@ -876,6 +882,71 @@ func (m *Module) handleRandomPlay(text string) bool {
 	m.player.SetExhaustedHandler(nil)
 	m.player.SetQueue(items)
 	return true
+}
+
+// randomSongsForMusic 返回随机歌曲（优先排除 stories[].dir 下的故事文件）。
+// 返回值 allCount 为曲库总数，用于区分"曲库为空"和"有内容但全是故事"。
+func (m *Module) randomSongsForMusic(n int) ([]IndexedSong, int) {
+	if n <= 0 {
+		n = m.config.Search.MaxResults
+	}
+	all := m.indexer.Songs()
+	if len(all) == 0 {
+		return nil, 0
+	}
+	storyDirs := m.storyDirsAbs()
+	pool := make([]IndexedSong, 0, len(all))
+	for _, s := range all {
+		if m.isStorySongByDir(s.Path, storyDirs) {
+			continue
+		}
+		pool = append(pool, s)
+	}
+	if len(pool) == 0 {
+		return nil, len(all)
+	}
+	rand.Shuffle(len(pool), func(a, b int) {
+		pool[a], pool[b] = pool[b], pool[a]
+	})
+	selectedPool := len(pool)
+	if len(pool) > n {
+		pool = pool[:n]
+	}
+	log.Printf("🎲 [music] 随机歌曲池: 总%d 首，排除故事后 %d 首，返回 %d 首", len(all), selectedPool, len(pool))
+	return pool, len(all)
+}
+
+func (m *Module) storyDirsAbs() []string {
+	dirs := make([]string, 0, len(m.config.Stories))
+	for _, s := range m.config.Stories {
+		d := strings.TrimSpace(s.Dir)
+		if d == "" {
+			continue
+		}
+		if abs, err := filepath.Abs(d); err == nil {
+			d = abs
+		}
+		d = strings.TrimSuffix(d, string(filepath.Separator))
+		dirs = append(dirs, d)
+	}
+	return dirs
+}
+
+func (m *Module) isStorySongByDir(path string, storyDirs []string) bool {
+	if len(storyDirs) == 0 {
+		return false
+	}
+	absPath, err := filepath.Abs(path)
+	if err == nil {
+		path = absPath
+	}
+	path = strings.TrimSuffix(path, string(filepath.Separator))
+	for _, d := range storyDirs {
+		if path == d || strings.HasPrefix(path, d+string(filepath.Separator)) {
+			return true
+		}
+	}
+	return false
 }
 
 func (m *Module) handleRefresh(text string) bool {
