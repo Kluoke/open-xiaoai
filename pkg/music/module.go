@@ -41,6 +41,10 @@ type Module struct {
 
 	defaultStoryMu     sync.RWMutex
 	defaultStorySeries string
+
+	// history 播放历史持久化（只针对故事/有声书）：记录"最近播放到哪个系列第几集"，
+	// 支撑"继续播放故事"跨会话/跨重启恢复。参见 history.go。
+	history *PlayHistoryStore
 }
 
 type lxResolver interface {
@@ -65,6 +69,7 @@ func New(cfg *MusicConfig) *Module {
 		player:  nil, // 在 Start 时初始化，依赖 fileSrv 和 indexer
 		lx:      lx,
 		jobWake: make(chan struct{}, 1),
+		history: NewPlayHistoryStore(cfg.History.File),
 	}
 }
 
@@ -100,6 +105,9 @@ func (m *Module) Start(ctx context.Context) error {
 		WithWatchdog(watchdogEnabled),
 		WithPreemptMargin(preemptMarginSec),
 		WithEpisodeAnnouncement(announceEpisode),
+		WithOnEpisodeChange(func(item SongItem) {
+			m.history.Update(item.SeriesName, item.Episode, item.Path)
+		}),
 	)
 
 	// 先尝试加载磁盘缓存，让 Start 立刻就能用到已有曲库。
@@ -107,6 +115,9 @@ func (m *Module) Start(ctx context.Context) error {
 	// 这段时间 Start 已经返回，HTTP 服务和事件处理都能正常工作。
 	if err := m.indexer.Load(); err != nil {
 		log.Printf("⚠️ [music] 加载曲库索引失败: %v", err)
+	}
+	if err := m.history.Load(); err != nil {
+		log.Printf("⚠️ [music] 加载播放历史失败: %v", err)
 	}
 
 	// 启动 HTTP 文件服务
@@ -393,6 +404,11 @@ func (m *Module) classifyInstruction(text, normalized string) func() {
 			log.Printf("🎯 [music] 命中 random_play_keywords")
 			m.handleRandomPlay(text)
 		}
+	case m.matchExact(normalized, m.config.Commands.ContinueStoryKeywords):
+		return func() {
+			log.Printf("🎯 [music] 命中 continue_story_keywords")
+			m.handleContinueStory()
+		}
 	}
 	if keyword := m.extractPlayKeyword(text); keyword != "" {
 		return func() {
@@ -524,21 +540,43 @@ func (m *Module) applyDefaultStoryContext(intent PlayIntent) PlayIntent {
 }
 
 func (m *Module) handlePlay(keyword string) bool {
+	intent := ParsePlayIntent(keyword)
+	intent = m.applyDefaultStoryContext(intent)
+	return m.playIntent(intent, false)
+}
+
+// handleContinueStory 处理"继续播放故事"类口令：读取 play_history.json 里记录的
+// 最近一次系列名+集数，自动接着播放，不需要用户再报一遍系列名。
+func (m *Module) handleContinueStory() bool {
+	entry := m.history.Get()
+	if entry.SeriesName == "" {
+		log.Printf("🎯 [music] 继续播放故事: 没有历史记录")
+		m.player.Speak("还没有听过故事，不知道该接着播放什么")
+		return true
+	}
+	log.Printf("🎯 [music] 继续播放故事: series=%q episode=%d", entry.SeriesName, entry.Episode)
+	intent := PlayIntent{SeriesName: entry.SeriesName, Episode: entry.Episode, IsStory: true}
+	return m.playIntent(intent, true)
+}
+
+// playIntent handlePlay/handleContinueStory 共用的核心播放逻辑：给定一个已经解析好的
+// PlayIntent，搜索并播放。isContinuation 为 true 时：
+//   - 搜索无结果不会退化到在线搜索（LX），因为"继续播放故事"场景下用户没有要求搜别的；
+//   - 反馈语用"接着播放"而不是"找到 X 集"，更符合"继续"的语义。
+func (m *Module) playIntent(intent PlayIntent, isContinuation bool) bool {
 	hasLocalDirs := len(m.config.Dirs) > 0
 	if !hasLocalDirs && m.lx == nil {
-		log.Printf("⚠️ [music] handlePlay 中止: dirs 未配置")
+		log.Printf("⚠️ [music] playIntent 中止: dirs 未配置")
 		m.player.Speak("本地音乐目录还没有配置")
 		return true
 	}
-	intent := ParsePlayIntent(keyword)
-	intent = m.applyDefaultStoryContext(intent)
 	if intent.SeriesName == "" {
 		m.player.Speak("请告诉我想播放哪个故事或歌曲")
 		return true
 	}
 	useEpisode := intent.Episode > 0 || intent.IsStory || m.matchStory(intent.SeriesName)
-	log.Printf("🎵 [music] handlePlay: keyword=%q intent={series=%q episode=%d isStory=%v} useEpisode=%v",
-		keyword, intent.SeriesName, intent.Episode, intent.IsStory, useEpisode)
+	log.Printf("🎵 [music] playIntent: intent={series=%q episode=%d isStory=%v} useEpisode=%v continuation=%v",
+		intent.SeriesName, intent.Episode, intent.IsStory, useEpisode, isContinuation)
 
 	var songs []IndexedSong
 	if !hasLocalDirs {
@@ -550,6 +588,10 @@ func (m *Module) handlePlay(keyword string) bool {
 	}
 	if len(songs) == 0 {
 		log.Printf("🔍 [music] 搜索无结果: series=%q episode=%d", intent.SeriesName, intent.Episode)
+		if isContinuation {
+			m.player.Speak(fmt.Sprintf("没有找到%s第%d集，可能文件被移动或删除了", intent.SeriesName, intent.Episode))
+			return true
+		}
 		if !useEpisode && m.handleLXPlay(intent.SeriesName) {
 			return true
 		}
@@ -561,7 +603,7 @@ func (m *Module) handlePlay(keyword string) bool {
 		return true
 	}
 	log.Printf("🔍 [music] 搜索命中 %d 首, 首条=%s", len(songs), songs[0].Path)
-	items := m.player.BuildQueueFromSongs(songs)
+	items := m.player.BuildQueueFromSongs(songs, intent.SeriesName)
 	log.Printf("🎵 [music] 构建队列: %d 首 (过滤后)", len(items))
 
 	// 时序：
@@ -585,11 +627,16 @@ func (m *Module) handlePlay(keyword string) bool {
 	// 3) SetQueue → PlayURL：切到本地 URL
 	//
 
-	feedback := fmt.Sprintf("好的，找到%d首歌曲", len(items))
-	if intent.Episode > 0 {
+	var feedback string
+	switch {
+	case isContinuation:
+		feedback = fmt.Sprintf("好的，接着播放%s，从第%d集继续", intent.SeriesName, intent.Episode)
+	case intent.Episode > 0:
 		feedback = fmt.Sprintf("好的，找到%d集，从第%d集开始播放", len(items), intent.Episode)
-	} else if useEpisode {
+	case useEpisode:
 		feedback = fmt.Sprintf("好的，找到%d集", len(items))
+	default:
+		feedback = fmt.Sprintf("好的，找到%d首歌曲", len(items))
 	}
 
 	if useEpisode {
@@ -640,7 +687,7 @@ func (m *Module) buildEpisodeContinuation(seriesName string, firstBatch []Indexe
 		}
 		log.Printf("🔍 [music] 续播: series=%q 拉取下一批 从第%d集开始 → %d 项", seriesName, next, len(more))
 		lastEpisode = newLast
-		return m.player.BuildQueueFromSongs(more)
+		return m.player.BuildQueueFromSongs(more, seriesName)
 	}
 }
 
@@ -871,7 +918,7 @@ func (m *Module) handleRandomPlay(text string) bool {
 		}
 		return true
 	}
-	items := m.player.BuildQueueFromSongs(songs)
+	items := m.player.BuildQueueFromSongs(songs, "")
 	log.Printf("🎵 [music] 随机播放: %d 首", len(items))
 
 	// 在 Speak 之前打断云端：云端识别"随便听听"后会推自己那套随机清单

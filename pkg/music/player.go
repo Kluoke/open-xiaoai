@@ -121,6 +121,10 @@ type SongItem struct {
 	// Episode 集数，来自 IndexedSong.Episode，0 表示非分集内容（普通音乐/在线歌曲）。
 	// 用于播放前播报"现在播放第 X 集"，方便小朋友知道当前进度、中断后也能知道听到第几集了。
 	Episode int
+	// SeriesName 系列名（如「西游记」），来自 handlePlay 解析出的 PlayIntent.SeriesName。
+	// 仅故事/有声书队列会填充；普通音乐/在线歌曲为空。用于 onEpisodeChange 回调记录
+	// "最近播放到哪个系列第几集"，支撑"继续播放故事"语音指令，不参与播放本身的逻辑。
+	SeriesName string
 }
 
 // Player 播放器：队列、RPC 调用、Idle 切歌
@@ -163,6 +167,12 @@ type Player struct {
 	// announceEpisodeBeforePlay 控制是否在播放分集内容（Episode>0）前播报
 	// "现在播放第X集"。
 	announceEpisodeBeforePlay bool
+
+	// onEpisodeChange 每次切到一个新的分集内容（item.Episode>0）时触发，用于记录
+	// "最近播放到哪个系列第几集"（供"继续播放故事"读取）。故意设计成"只通知，
+	// 不参与播放决策"：回调里不能反过来调用 Player 上任何需要 p.mu 的方法。
+	// nil 表示未启用（比如没有配置 history.file）。
+	onEpisodeChange func(item SongItem)
 
 	// initialStateCh 在收到第一个 playing 事件时关闭，用来给上层"等一下首个状态"的能力，
 	// 取代之前注释里建议的 Sleep 推断（不可靠）。
@@ -211,6 +221,14 @@ func WithPreemptMargin(seconds int) PlayerOption {
 func WithEpisodeAnnouncement(enabled bool) PlayerOption {
 	return func(p *Player) {
 		p.announceEpisodeBeforePlay = enabled
+	}
+}
+
+// WithOnEpisodeChange 注册"切到新一集"的回调，用于记录播放历史（继续播放故事）。
+// fn 会在独立 goroutine 里异步调用，不阻塞播放主流程，也不需要关心 p.mu。
+func WithOnEpisodeChange(fn func(item SongItem)) PlayerOption {
+	return func(p *Player) {
+		p.onEpisodeChange = fn
 	}
 }
 
@@ -625,6 +643,11 @@ func (p *Player) playItemLocked(item SongItem, recordHistory, announce bool) boo
 		return false
 	}
 	log.Printf("🎵 [music/player] 正在播放: %s (剩余队列=%d 历史=%d)", item.Path, queueLen, histLen)
+	if p.onEpisodeChange != nil && item.Episode > 0 {
+		// 异步触发：磁盘 IO 不应该占用 p.mu、也不应该拖慢播放主流程。
+		cb := p.onEpisodeChange
+		go cb(item)
+	}
 	return true
 }
 
@@ -851,15 +874,17 @@ func copySongItems(items []SongItem) []SongItem {
 	return out
 }
 
-// BuildQueueFromSongs 从 IndexedSong 列表构建队列，并授权 HTTP 服务访问这些文件
-func (p *Player) BuildQueueFromSongs(songs []IndexedSong) []SongItem {
+// BuildQueueFromSongs 从 IndexedSong 列表构建队列，并授权 HTTP 服务访问这些文件。
+// seriesName 非空时会写入每个 SongItem.SeriesName，供 onEpisodeChange 回调记录播放历史
+// （"继续播放故事"依赖它）；普通音乐/随机播放/在线歌曲场景传空字符串即可。
+func (p *Player) BuildQueueFromSongs(songs []IndexedSong, seriesName string) []SongItem {
 	items := make([]SongItem, 0, len(songs))
 	skipped := 0
 	for _, s := range songs {
 		p.fileServer.AllowFile(s.Path)
 		url := p.fileServer.CreateFileURL(s.Path)
 		if url != "" {
-			items = append(items, SongItem{Path: s.Path, URL: url, Size: s.Size, DurationMs: s.DurationMs, Episode: s.Episode})
+			items = append(items, SongItem{Path: s.Path, URL: url, Size: s.Size, DurationMs: s.DurationMs, Episode: s.Episode, SeriesName: seriesName})
 		} else {
 			skipped++
 			log.Printf("⚠️ [music/player] BuildQueue 跳过 (URL 生成失败): %s", s.Path)

@@ -7,6 +7,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 type fakeLXResolver struct {
@@ -423,5 +424,150 @@ func TestHandleRandomPlayPrefersSongsOutsideStoryDirs(t *testing.T) {
 		if strings.HasPrefix(item.Path, "/gushi/三国演义第1季/") {
 			t.Fatalf("expected random playlist to exclude story dir, got %+v", player.playlist)
 		}
+	}
+}
+
+// TestHandleContinueStoryNoHistorySpeaksMessage 还没有任何播放记录时，
+// "继续播放故事"应该提示用户，而不是报错或静默失败。
+func TestHandleContinueStoryNoHistorySpeaksMessage(t *testing.T) {
+	cfg := &MusicConfig{Enabled: true, Dirs: []string{"/gushi"}}
+	cfg.ApplyDefaults()
+
+	idx := NewIndexer(cfg)
+	player := NewPlayer(nil, idx)
+	spoken := []string{}
+	player.speak = func(text string) error {
+		spoken = append(spoken, text)
+		return nil
+	}
+
+	module := &Module{
+		config:  cfg,
+		indexer: idx,
+		player:  player,
+		history: NewPlayHistoryStore(""), // 空文件名 -> 永远没有历史
+	}
+
+	if !module.handleContinueStory() {
+		t.Fatal("expected handleContinueStory to be handled")
+	}
+	if len(spoken) != 1 || spoken[0] != "还没有听过故事，不知道该接着播放什么" {
+		t.Fatalf("unexpected spoken feedback: %v", spoken)
+	}
+}
+
+// TestHandleContinueStoryPlaysFromHistory 有历史记录时，应该自动从记录的系列名+集数
+// 继续播放，不需要用户报出系列名。
+func TestHandleContinueStoryPlaysFromHistory(t *testing.T) {
+	abort := false
+	cfg := &MusicConfig{
+		Enabled:  true,
+		Dirs:     []string{"/gushi"},
+		Search:   SearchConfig{MaxResults: 20},
+		Commands: CommandsConfig{AbortXiaoAIOnPlay: &abort},
+	}
+	cfg.ApplyDefaults()
+
+	idx := NewIndexer(cfg)
+	idx.songs = []IndexedSong{
+		{Path: "/gushi/023.mp3", NameLower: "西游记023", Episode: 23},
+		{Path: "/gushi/024.mp3", NameLower: "西游记024", Episode: 24},
+	}
+	fileSrv := NewFileServer(&HTTPConfig{Port: 18080, BaseURL: "http://music.local"})
+	played := []string{}
+	spoken := []string{}
+	player := NewPlayer(fileSrv, idx)
+	player.playURL = func(url string) error {
+		played = append(played, url)
+		return nil
+	}
+	player.speak = func(text string) error {
+		spoken = append(spoken, text)
+		return nil
+	}
+
+	history := NewPlayHistoryStore("")
+	history.Update("西游记", 24, "/gushi/024.mp3")
+
+	module := &Module{config: cfg, indexer: idx, fileSrv: fileSrv, player: player, history: history}
+
+	if !module.handleContinueStory() {
+		t.Fatal("expected handleContinueStory to succeed")
+	}
+	if len(played) != 1 || !strings.Contains(played[0], "024.mp3") {
+		t.Fatalf("expected episode 24 to play, got %v", played)
+	}
+	if len(spoken) != 1 || spoken[0] != "好的，接着播放西游记，从第24集继续" {
+		t.Fatalf("unexpected spoken feedback: %v", spoken)
+	}
+}
+
+// TestClassifyInstructionRoutesContinueStoryKeyword 确认"继续播放故事"这类口令能被
+// classifyInstruction 正确识别、路由到 handleContinueStory，而不会被其他分支截胡
+// （比如误判成普通"播放"指令）。
+func TestClassifyInstructionRoutesContinueStoryKeyword(t *testing.T) {
+	cfg := &MusicConfig{Enabled: true, Dirs: []string{"/gushi"}}
+	cfg.ApplyDefaults()
+
+	idx := NewIndexer(cfg)
+	idx.songs = []IndexedSong{{Path: "/gushi/007.mp3", NameLower: "西游记007", Episode: 7}}
+	fileSrv := NewFileServer(&HTTPConfig{Port: 18080, BaseURL: "http://music.local"})
+	player := NewPlayer(fileSrv, idx)
+	played := []string{}
+	player.playURL = func(url string) error {
+		played = append(played, url)
+		return nil
+	}
+	player.speak = func(text string) error { return nil }
+
+	history := NewPlayHistoryStore("")
+	history.Update("西游记", 7, "/gushi/007.mp3")
+
+	module := &Module{config: cfg, indexer: idx, fileSrv: fileSrv, player: player, history: history}
+
+	job := module.classifyInstruction("继续播放故事", NormalizedForMatch("继续播放故事"))
+	if job == nil {
+		t.Fatal("expected continue_story_keywords to be classified")
+	}
+	job()
+	if len(played) != 1 {
+		t.Fatalf("expected continue story job to trigger playback, got %v", played)
+	}
+}
+
+// TestOnEpisodeChangeCallbackRecordsHistory 验证 Player 在切到新一集时会异步触发
+// onEpisodeChange 回调（真正的落盘由 Module.history.Update 完成，这里只验证回调触发
+// 且携带正确的 SeriesName/Episode/Path）。
+func TestOnEpisodeChangeCallbackRecordsHistory(t *testing.T) {
+	fileSrv := NewFileServer(&HTTPConfig{Port: 18080, BaseURL: "http://music.local"})
+	idx := &Indexer{}
+
+	type change struct {
+		series  string
+		episode int
+		path    string
+	}
+	changed := make(chan change, 4)
+	p := NewPlayer(fileSrv, idx, WithWatchdog(false), WithOnEpisodeChange(func(item SongItem) {
+		changed <- change{item.SeriesName, item.Episode, item.Path}
+	}))
+	p.playURL = func(url string) error {
+		p.lastPlayURLAt = time.Now().Add(-playGracePeriod)
+		return nil
+	}
+	p.speak = func(text string) error { return nil }
+
+	items := []SongItem{
+		{Path: "/gushi/001.mp3", URL: "http://music/001.mp3", Episode: 1, SeriesName: "西游记"},
+	}
+	p.SetQueue(items)
+
+	select {
+	case got := <-changed:
+		if got.series != "西游记" || got.episode != 1 || got.path != "/gushi/001.mp3" {
+			t.Fatalf("unexpected onEpisodeChange payload: %+v", got)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("expected onEpisodeChange to fire")
 	}
 }

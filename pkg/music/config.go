@@ -11,6 +11,14 @@ type MusicConfig struct {
 	LX         LXConfig       `yaml:"lx"`
 	Player     PlayerConfig   `yaml:"player"`
 	Stories    []StoryConfig  `yaml:"stories"` // 故事/有声书分类，用于精确匹配与集数解析
+	History    HistoryConfig  `yaml:"history"` // 播放历史（"继续播放故事"依赖的持久化记录）
+}
+
+// HistoryConfig 播放历史持久化配置。
+// 只针对故事/有声书：记录"最近一次听的系列名 + 集数"，支持跨重启的
+// "继续播放故事"语音指令。普通音乐/在线歌曲不记录（没有"集"的概念）。
+type HistoryConfig struct {
+	File string `yaml:"file"` // 历史记录文件路径，空则用默认值 cache/play_history.json
 }
 
 // StoryConfig 故事/有声书配置
@@ -39,6 +47,11 @@ type CommandsConfig struct {
 	RepeatOneKeywords   []string `yaml:"repeat_one_keywords"`
 	RepeatAllKeywords   []string `yaml:"repeat_all_keywords"`
 	ShuffleModeKeywords []string `yaml:"shuffle_mode_keywords"`
+
+	// ContinueStoryKeywords："继续播放故事"类口令：读取 play_history.json 里记录的
+	// 最近一次系列名+集数，自动接着播放，不需要用户报出系列名。只针对故事/有声书场景，
+	// 刻意不做成通用的"继续播放"（避免和普通音乐/暂停恢复语义混淆）。
+	ContinueStoryKeywords []string `yaml:"continue_story_keywords"`
 
 	// AbortXiaoAIOnPlay：handlePlay 时是否同步重启 mico_aivs_lab，杀掉小爱云端 NLP 流水线。
 	// 解决"我们 player_play_url 本地歌后，小爱云端识别同一句话再返回试听版 URL 覆盖我们"的竞态。
@@ -155,6 +168,10 @@ var DefaultCommands = CommandsConfig{
 	RepeatOneKeywords:   []string{"单曲循环"},
 	RepeatAllKeywords:   []string{"全部循环", "列表循环"},
 	ShuffleModeKeywords: []string{"随机播放"},
+	ContinueStoryKeywords: []string{
+		"继续播放故事", "接着播放故事", "继续听故事", "接着听故事",
+		"继续讲故事", "接着讲故事", "继续故事", "接着故事",
+	},
 }
 
 // ApplyDefaults 填充默认值
@@ -168,6 +185,9 @@ func (c *MusicConfig) ApplyDefaults() {
 	}
 	if c.Search.IndexFile == "" {
 		c.Search.IndexFile = "cache/music_index.json"
+	}
+	if c.History.File == "" {
+		c.History.File = "cache/play_history.json"
 	}
 	if c.LX.Source == "" {
 		c.LX.Source = "kw"
@@ -213,6 +233,10 @@ func (c *MusicConfig) ApplyDefaults() {
 	if len(c.Commands.ShuffleModeKeywords) == 0 {
 		c.Commands.ShuffleModeKeywords = make([]string, len(DefaultCommands.ShuffleModeKeywords))
 		copy(c.Commands.ShuffleModeKeywords, DefaultCommands.ShuffleModeKeywords)
+	}
+	if len(c.Commands.ContinueStoryKeywords) == 0 {
+		c.Commands.ContinueStoryKeywords = make([]string, len(DefaultCommands.ContinueStoryKeywords))
+		copy(c.Commands.ContinueStoryKeywords, DefaultCommands.ContinueStoryKeywords)
 	}
 	if c.Commands.AbortXiaoAIOnPlay == nil {
 		// 默认开启：解决小爱云端 NLP 抢占本地播放的竞态问题
