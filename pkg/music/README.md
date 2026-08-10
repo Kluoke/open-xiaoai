@@ -454,13 +454,59 @@ music:
 > `随便听听` 默认按"听歌"语义处理：若配置了 `stories[].dir`，会优先从非故事目录随机取歌，避免随机到故事集。
 > 若未配置 `stories[].dir`，模块无法区分故事与歌曲，随机结果会来自整个曲库。
 
-LX Sync Server 项目地址：[XCQ0607/lxserver](https://github.com/XCQ0607/lxserver)。
+启用 `music.lx.enabled` 后，`播放某首歌` 会先搜索本地曲库；如果本地没有命中且不是故事/有声书集数播放，就会走在线兜底搜索/取直链。支持三种接法，看你怎么部署：
 
-启用 `music.lx.enabled` 后，`播放某首歌` 会先搜索本地曲库；如果本地没有命中且不是故事/有声书集数播放，就会调用 LX Sync Server：
+- **内嵌模式（推荐）**：`pkg/lx-go` 直接以 Go 库的形式 import 进 `pkg/music` 进程里，不用你手动另起进程/端口，搜索/取直链全是进程内函数调用。
+- **独立服务模式**：单独跑一个 `pkg/lx-go` 进程，`pkg/music` 通过 HTTP（`base_url`）对接，两边可以分开部署在不同机器上。
+- **第三方 LX Server**：接第三方项目 [XCQ0607/lxserver](https://github.com/XCQ0607/lxserver)，同样走 HTTP，需要账号/Token。
+
+#### 内嵌模式（推荐）：不用手动起进程
+
+```yaml
+music:
+  enabled: true
+  lx:
+    enabled: true
+    embedded: true
+    embedded_js_dir: "../lx-go/js"   # 指向音源脚本（可以多个）目录，相对/绝对路径都行
+    download: true
+    download_dir: ""  # 空则下载到 music.dirs[0]
+    source: "wy"
+    quality: "128k"
+```
+
+`pkg/music/go.mod` 用 `replace` 把 `pkg/lx-go` 当本地模块引进来，`lx_embedded.go` 里的 `EmbeddedLX` 实现了跟 `LXClient` 一样的接口（`Resolve`/`Download`），`Module.New()` 看到 `embedded: true` 就会自动用这个实现，不再走任何 HTTP/端口。这套接法已经实测跑通过：进程内直接调用，加载 6 个音源脚本、自检、搜索「周杰伦 稻香」、取直链、下载到本地文件全流程一次跑通。详见 [pkg/lx-go/README.md](../lx-go/README.md#接入-pkgmusic)。
+
+#### 独立服务模式：单独起一个 lx-go 进程，走 HTTP
+
+```bash
+cd pkg/lx-go
+go run ./cmd/lxgo-server   # 默认监听 :8080
+```
+
+```yaml
+music:
+  enabled: true
+  lx:
+    enabled: true
+    base_url: "http://127.0.0.1:8080"   # pkg/lx-go 默认端口，和 music 自己的文件服务端口 18080 不冲突
+    download: true
+    download_dir: ""  # 空则下载到 music.dirs[0]
+    source: "wy"
+    quality: "128k"
+    # username/password/user_token/frontend_auth 都不用填：
+    # pkg/lx-go 本身不做鉴权，留空的话这边也不会去调用 /api/user/login
+```
+
+这个模式下，`pkg/music` 通过 `LXClient`（`pkg/music/lx.go`）走标准 HTTP 协议对接：
 
 1. `GET /api/music/search?name={keyword}&source={source}&type=song&page=1&pages=1`
 2. `POST /api/music/url`，请求体为 `{"songInfo": <第一条搜索结果>, "quality": "128k"}`
 3. 将返回的 `url` 交给小爱设备播放
+
+这套配置已经用未经修改的 `LXClient` 实测跑通过：搜索 → 取直链 → 代理下载到本地，全流程可用。
+
+#### 用第三方 LX Server（需要账号/Token）
 
 示例：
 

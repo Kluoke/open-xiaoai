@@ -48,3 +48,5 @@ __pycache__
 .mi.json
 xiaozhi.json
 open-xiaoai.node
+pkg/lx-go/js/*.js
+pkg/lx-go/lx-go

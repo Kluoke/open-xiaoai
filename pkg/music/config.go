@@ -98,6 +98,14 @@ type LXConfig struct {
 	Source       string `yaml:"source"`
 	Quality      string `yaml:"quality"`
 	TimeoutSec   int    `yaml:"timeout_sec"`
+
+	// Embedded 为 true 时，不走 base_url 请求外部/独立起的 LX Sync Server，
+	// 而是直接在本进程内加载 pkg/lx-go 引擎（不需要手动另起一个进程/端口）。
+	// 开启后 base_url/username/password/user_token/frontend_auth 都不再需要，
+	// 必须配置 embedded_js_dir 指向音源脚本目录。
+	Embedded bool `yaml:"embedded"`
+	// EmbeddedJSDir 内嵌模式下的音源脚本目录，一般填 pkg/lx-go/js 的绝对/相对路径。
+	EmbeddedJSDir string `yaml:"embedded_js_dir"`
 }
 
 // PlayerConfig 播放器行为配置，核心是"主动续播"机制，用来抢在设备原生内容续播机制之前

@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"log"
 	"math/rand/v2"
 	"net/url"
@@ -59,8 +60,19 @@ func New(cfg *MusicConfig) *Module {
 	}
 	cfg.ApplyDefaults()
 	var lx lxResolver
-	if cfg.LX.Enabled && cfg.LX.BaseURL != "" {
-		lx = NewLXClient(&cfg.LX)
+	if cfg.LX.Enabled {
+		if cfg.LX.Embedded {
+			// 内嵌模式：不需要手动另起一个 lx-go 进程/端口，直接在本进程里
+			// 加载 pkg/lx-go 引擎，搜索/取直链都是进程内函数调用。
+			embedded, err := NewEmbeddedLX(&cfg.LX)
+			if err != nil {
+				log.Printf("⚠️ [music] 内嵌 lx-go 初始化失败，LX 在线兜底不可用（本地曲库仍可正常使用）: %v", err)
+			} else {
+				lx = embedded
+			}
+		} else if cfg.LX.BaseURL != "" {
+			lx = NewLXClient(&cfg.LX)
+		}
 	}
 	return &Module{
 		config:  cfg,
@@ -281,6 +293,11 @@ func (m *Module) Stop() error {
 	}
 	if m.player != nil {
 		m.player.ClearQueue()
+	}
+	if closer, ok := m.lx.(io.Closer); ok {
+		if err := closer.Close(); err != nil {
+			log.Printf("⚠️ [music] 关闭内嵌 lx-go 失败: %v", err)
+		}
 	}
 	log.Printf("🎵 [music] 已停止")
 	return nil
