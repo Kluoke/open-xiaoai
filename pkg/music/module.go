@@ -368,7 +368,7 @@ func (m *Module) handleInstruction(event connect.Event) bool {
 }
 
 // classifyInstruction 把规范化文本映射到一个具体的执行闭包。
-// 返回 nil 表示这条指令不归音乐模块管。优先级：stop > next/previous > modes > refresh > random > play。
+// 返回 nil 表示这条指令不归音乐模块管。优先级：stop > next/previous > modes > refresh > random > download > play。
 func (m *Module) classifyInstruction(text, normalized string) func() {
 	if cmd := ParseStoryContextCommand(text); cmd.Set || cmd.Query || cmd.Clear {
 		return func() {
@@ -425,6 +425,12 @@ func (m *Module) classifyInstruction(text, normalized string) func() {
 		return func() {
 			log.Printf("🎯 [music] 命中 continue_story_keywords")
 			m.handleContinueStory()
+		}
+	}
+	if keyword := m.extractKeyword(text, m.config.Commands.DownloadKeywords); keyword != "" {
+		return func() {
+			log.Printf("🎯 [music] 命中 download_keywords: 提取关键词=%q", keyword)
+			m.handleDownload(keyword)
 		}
 	}
 	if keyword := m.extractPlayKeyword(text); keyword != "" {
@@ -494,8 +500,12 @@ func (m *Module) matchExact(normalized string, keywords []string) bool {
 }
 
 func (m *Module) extractPlayKeyword(text string) string {
+	return m.extractKeyword(text, m.config.Commands.PlayKeywords)
+}
+
+func (m *Module) extractKeyword(text string, keywords []string) string {
 	norm := NormalizedForMatch(text)
-	for _, kw := range m.config.Commands.PlayKeywords {
+	for _, kw := range keywords {
 		kwNorm := NormalizedForMatch(kw)
 		if kwNorm == "" {
 			continue
@@ -560,6 +570,41 @@ func (m *Module) handlePlay(keyword string) bool {
 	intent := ParsePlayIntent(keyword)
 	intent = m.applyDefaultStoryContext(intent)
 	return m.playIntent(intent, false)
+}
+
+// handleDownload 只处理用户明确说出的“下载”指令，不受 lx.download 配置影响。
+// 普通“播放”永远在线播放，避免 download=true 导致用户随口播放的歌曲全部落盘。
+func (m *Module) handleDownload(keyword string) bool {
+	intent := ParsePlayIntent(keyword)
+	keyword = intent.SeriesName
+	if m.lx == nil {
+		m.player.Speak("在线音乐服务不可用，暂时无法下载")
+		return true
+	}
+	ctx := m.ctx
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	track, err := m.lx.Resolve(ctx, keyword)
+	if err != nil || track == nil || track.URL == "" {
+		log.Printf("⚠️ [music/lx] 下载前在线搜索失败: keyword=%q err=%v", keyword, err)
+		m.player.Speak(fmt.Sprintf("没有找到在线歌曲%s，无法下载", keyword))
+		return true
+	}
+	name := track.Name
+	if name == "" {
+		name = keyword
+	}
+	item, ok := m.downloadLXTrack(ctx, track, name)
+	if !ok {
+		m.player.Speak(fmt.Sprintf("下载%s失败，请稍后重试", name))
+		return true
+	}
+	m.maybeAbortXiaoAI()
+	_ = m.player.Speak(fmt.Sprintf("下载%s成功", name))
+	m.player.SetExhaustedHandler(nil)
+	m.player.SetQueue([]SongItem{item})
+	return true
 }
 
 // handleContinueStory 处理"继续播放故事"类口令：读取 play_history.json 里记录的
@@ -742,15 +787,7 @@ func (m *Module) handleLXPlay(keyword string) bool {
 	if name == "" {
 		name = keyword
 	}
-	if m.config.LX.Download {
-		if item, ok := m.downloadLXTrack(ctx, track, name); ok {
-			_ = m.player.Speak(fmt.Sprintf("好的，已下载在线歌曲%s", name))
-			m.player.SetExhaustedHandler(nil)
-			m.player.SetQueue([]SongItem{item})
-			return true
-		}
-	}
-	_ = m.player.Speak(fmt.Sprintf("好的，找到在线歌曲%s", name))
+	_ = m.player.Speak(fmt.Sprintf("好的，当前播放的是在线歌曲%s", name))
 	m.player.SetExhaustedHandler(nil)
 	m.player.SetQueue([]SongItem{{
 		Path: fmt.Sprintf("lx:%s-%s", track.Singer, name),

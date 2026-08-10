@@ -7,6 +7,7 @@ func TestApplyDefaultsAddsPlaybackControlKeywords(t *testing.T) {
 	cfg.ApplyDefaults()
 
 	assertContains(t, cfg.Commands.NextKeywords, "下一首")
+	assertContains(t, cfg.Commands.DownloadKeywords, "下载")
 	assertContains(t, cfg.Commands.PreviousKeywords, "上一首")
 	assertContains(t, cfg.Commands.RepeatOneKeywords, "单曲循环")
 	assertContains(t, cfg.Commands.RepeatAllKeywords, "全部循环")

@@ -93,12 +93,12 @@ func TestHandlePlayFallsBackToLXWhenLocalSearchMisses(t *testing.T) {
 	if len(played) != 1 || played[0] != "https://lx.example/qingtian.mp3" {
 		t.Fatalf("expected LX URL to be played, got %v", played)
 	}
-	if len(spoken) != 1 || spoken[0] != "好的，找到在线歌曲晴天" {
+	if len(spoken) != 1 || spoken[0] != "好的，当前播放的是在线歌曲晴天" {
 		t.Fatalf("unexpected spoken feedback: %v", spoken)
 	}
 }
 
-func TestHandlePlayDownloadsLXTrackWhenEnabled(t *testing.T) {
+func TestHandlePlayKeepsLXTrackOnlineEvenWhenDownloadEnabled(t *testing.T) {
 	dir := t.TempDir()
 	abort := false
 	cfg := &MusicConfig{
@@ -126,9 +126,7 @@ func TestHandlePlayDownloadsLXTrackWhenEnabled(t *testing.T) {
 		played = append(played, url)
 		return nil
 	}
-	player.speak = func(text string) error {
-		return nil
-	}
+	player.speak = func(text string) error { return nil }
 	resolver := &fakeLXResolver{
 		track: &LXTrack{
 			Name:   "晴天",
@@ -148,15 +146,47 @@ func TestHandlePlayDownloadsLXTrackWhenEnabled(t *testing.T) {
 	if !module.handlePlay("周杰伦晴天") {
 		t.Fatal("expected handlePlay to handle LX fallback")
 	}
+	if resolver.downloadPath != "" {
+		t.Fatalf("普通播放不应下载歌曲，got %q", resolver.downloadPath)
+	}
+	if len(played) != 1 || played[0] != "https://lx.example/qingtian.mp3" {
+		t.Fatalf("expected online URL to be played, got %v", played)
+	}
+}
+
+func TestHandleDownloadLXTrackDownloadsAndPlaysLocalFile(t *testing.T) {
+	dir := t.TempDir()
+	abort := false
+	cfg := &MusicConfig{
+		Enabled:  true,
+		Dirs:     []string{dir},
+		LX:       LXConfig{Enabled: true},
+		HTTP:     HTTPConfig{Port: 18080, BaseURL: "http://music.local"},
+		Commands: CommandsConfig{AbortXiaoAIOnPlay: &abort},
+	}
+	cfg.ApplyDefaults()
+	idx := NewIndexer(cfg)
+	fileSrv := NewFileServer(&cfg.HTTP)
+	played := []string{}
+	spoken := []string{}
+	player := NewPlayer(fileSrv, idx)
+	player.playURL = func(url string) error { played = append(played, url); return nil }
+	player.speak = func(text string) error { spoken = append(spoken, text); return nil }
+	resolver := &fakeLXResolver{track: &LXTrack{Name: "晴天", Singer: "周杰伦", URL: "https://lx.example/qingtian.mp3"}}
+	module := &Module{config: cfg, indexer: idx, fileSrv: fileSrv, player: player, lx: resolver}
+
+	if !module.handleDownload("周杰伦晴天") {
+		t.Fatal("expected handleDownload to handle LX track")
+	}
 	wantPath := filepath.Join(dir, "晴天 - 周杰伦.mp3")
 	if resolver.downloadPath != wantPath {
 		t.Fatalf("expected download path %q, got %q", wantPath, resolver.downloadPath)
 	}
-	if _, err := os.Stat(wantPath); err != nil {
-		t.Fatalf("expected downloaded file: %v", err)
-	}
 	if len(played) != 1 || !strings.HasPrefix(played[0], "http://music.local/file/") {
 		t.Fatalf("expected local file URL to be played, got %v", played)
+	}
+	if len(spoken) != 1 || spoken[0] != "下载晴天成功" {
+		t.Fatalf("unexpected spoken feedback: %v", spoken)
 	}
 }
 

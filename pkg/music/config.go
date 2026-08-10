@@ -39,6 +39,7 @@ type SearchConfig struct {
 // CommandsConfig 指令关键词配置
 type CommandsConfig struct {
 	PlayKeywords        []string `yaml:"play_keywords"`
+	DownloadKeywords    []string `yaml:"download_keywords"`
 	StopKeywords        []string `yaml:"stop_keywords"`
 	NextKeywords        []string `yaml:"next_keywords"`
 	PreviousKeywords    []string `yaml:"previous_keywords"`
@@ -164,8 +165,9 @@ const DefaultEpisodePattern = `第?(\d+)[集回]?`
 
 // DefaultCommands 默认指令关键词
 var DefaultCommands = CommandsConfig{
-	PlayKeywords:        []string{"播放"},
-	StopKeywords:        []string{"停止播放", "暂停播放", "暂停", "停止", "闭嘴", "别放了", "不要放了", "关机"},
+	PlayKeywords:     []string{"播放"},
+	DownloadKeywords: []string{"下载"},
+	StopKeywords:     []string{"停止播放", "暂停播放", "暂停", "停止", "闭嘴", "别放了", "不要放了", "关机"},
 	// 覆盖"首/个"（普通音乐语境）和"集/章/回"（故事/有声书按集播放语境）两类说法，
 	// 否则用户在听故事时说"下一集"会因为 matchExact 精确匹配不上"下一首"而被当成
 	// 非音乐指令直接忽略（实测过的真实 bug）。
@@ -209,6 +211,10 @@ func (c *MusicConfig) ApplyDefaults() {
 	if len(c.Commands.PlayKeywords) == 0 {
 		c.Commands.PlayKeywords = make([]string, len(DefaultCommands.PlayKeywords))
 		copy(c.Commands.PlayKeywords, DefaultCommands.PlayKeywords)
+	}
+	if len(c.Commands.DownloadKeywords) == 0 {
+		c.Commands.DownloadKeywords = make([]string, len(DefaultCommands.DownloadKeywords))
+		copy(c.Commands.DownloadKeywords, DefaultCommands.DownloadKeywords)
 	}
 	if len(c.Commands.StopKeywords) == 0 {
 		c.Commands.StopKeywords = make([]string, len(DefaultCommands.StopKeywords))

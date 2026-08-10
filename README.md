@@ -14,7 +14,7 @@ Open-XiaoAI 通过运行在音箱上的 client 补丁程序，把小爱音箱的
 - 接入 `apps/gemini`：把小爱音箱接到 Gemini Live API，走端到端实时语音对话。
 - 启用 `pkg/music`：用语音播放本地歌曲、故事、有声书，支持上一首、下一首、随机播放、循环模式和自动切歌。
 - 播放网络歌曲：本地曲库找不到时，调用 LX Sync Server 搜索歌曲并获取播放链接。
-- 下载网络歌曲：开启 `music.lx.download` 后，通过 LX Sync Server 的代理下载能力把歌曲保存到本地目录，再播放本地文件。
+- 下载网络歌曲：明确说“下载歌曲名”后，通过 LX Sync Server 的代理下载到本地目录，下载成功后再播放本地文件。
 - 自己扩展能力：Server 端收到音箱事件后可以接任意 AI、Agent、脚本或家庭自动化逻辑。
 
 ## 项目结构
@@ -140,7 +140,7 @@ music:
 
     # false: 直接播放 LX 返回的远程 URL
     # true:  通过 LX 代理下载到本地后播放
-    download: true
+     download: false            # 普通播放不下载；说“下载歌曲”时才保存
     download_dir: ""  # 空则下载到 music.dirs[0]
 
     # LX 音源：kw=酷我，tx=QQ音乐，wy=网易云，kg=酷狗，mg=咪咕
@@ -153,7 +153,7 @@ music:
 
 - 如果你说“播放稻香”，本地曲库能找到《稻香》，就直接播放本地文件。
 - 如果你说“播放周杰伦”，本地曲库里有周杰伦的歌，就播放本地搜索到的周杰伦歌曲列表。
-- 如果本地没有《稻香》，你可以说“播放周杰伦的稻香”，`pkg/music` 会调用 LX Sync Server 搜索；若 `download: true`，会下载为 `稻香 - 周杰伦.mp3` 后播放。
+- 如果本地没有《稻香》，你可以说“播放周杰伦的稻香”，`pkg/music` 会调用 LX Sync Server 搜索并在线播放；说“下载周杰伦的稻香”才会下载为 `稻香 - 周杰伦.mp3` 后播放。
 - 只要本地有任何命中，就不会触发 LX 远程搜索或下载。
 
 文档：[`pkg/music/README.md`](pkg/music/README.md)
