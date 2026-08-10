@@ -37,6 +37,7 @@ type Server struct {
 
 	cacheMu sync.Mutex
 	cache   map[string]cacheEntry
+	closeCh chan struct{}
 
 	// defaultSearchMu/defaultSearchName 是当前"默认搜索音源"，由
 	// GET /api/music/switch-source 手动切换；GET /api/music/search 会把它
@@ -50,11 +51,58 @@ type cacheEntry struct {
 	expiresAt time.Time
 }
 
+// cacheSweepInterval 是清理过期缓存条目的后台扫描周期。cacheGet 本身在命中
+// 同一个 key 时也会顺手清理过期项，但从未被再次访问的 key（比如攻击者/异常
+// 客户端不断换关键词、每次都是新 key）不会走到那条路径，只能靠这个后台扫描
+// 兜底，否则 cache map 会无限增长（内存泄漏 / 事实上的 DoS 面）。
+const cacheSweepInterval = time.Minute
+
 func NewServer(registry *Registry) *Server {
-	return &Server{
+	s := &Server{
 		registry: registry,
 		progress: NewProgressHub(),
 		cache:    make(map[string]cacheEntry),
+		closeCh:  make(chan struct{}),
+	}
+	go s.sweepCacheLoop()
+	return s
+}
+
+// Close 停止后台缓存清理协程。跟 registry.Close() 是分开的两件事：Server 只
+// 负责 HTTP 层的缓存/进度状态，音源脚本自己的 goja 事件循环由 Registry 管理。
+func (s *Server) Close() {
+	if s == nil || s.closeCh == nil {
+		return
+	}
+	select {
+	case <-s.closeCh:
+		// 已经关过了
+	default:
+		close(s.closeCh)
+	}
+}
+
+func (s *Server) sweepCacheLoop() {
+	ticker := time.NewTicker(cacheSweepInterval)
+	defer ticker.Stop()
+	for {
+		select {
+		case <-ticker.C:
+			s.sweepExpiredCache()
+		case <-s.closeCh:
+			return
+		}
+	}
+}
+
+func (s *Server) sweepExpiredCache() {
+	now := time.Now()
+	s.cacheMu.Lock()
+	defer s.cacheMu.Unlock()
+	for k, entry := range s.cache {
+		if now.After(entry.expiresAt) {
+			delete(s.cache, k)
+		}
 	}
 }
 
@@ -534,5 +582,9 @@ func canonicalJSON(v any) string {
 
 func writeJSON(w http.ResponseWriter, data any) {
 	w.Header().Set("Content-Type", "application/json")
-	_ = json.NewEncoder(w).Encode(data)
+	if err := json.NewEncoder(w).Encode(data); err != nil {
+		// 这时候响应头已经发出去了，没法再改成 500 了，只能记日志方便排查
+		// "客户端收到截断 JSON" 这类问题。
+		log.Printf("⚠️  [lx-go] writeJSON encode failed: %v", err)
+	}
 }

@@ -1,9 +1,28 @@
 package lxgo
 
 import (
+	"fmt"
 	"log"
 	"net/http"
+	"runtime/debug"
 )
+
+// recoverMiddleware 给 handler 包一层 panic 恢复：goja/JS 脚本这条链路本来就
+// 有类型断言失败、脚本抛出非预期形状异常等风险，一旦某个请求触发 panic 而没有
+// recover，Go 默认行为是直接崩掉整个进程（http.Server 本身只保证按 goroutine
+// 隔离，但不 recover 业务 panic）。这里统一兜底，panic 时记日志、返回 500，
+// 不让一次请求的异常影响其它正在处理的请求。
+func recoverMiddleware(name string, h http.HandlerFunc) http.HandlerFunc {
+	return func(w http.ResponseWriter, r *http.Request) {
+		defer func() {
+			if rec := recover(); rec != nil {
+				log.Printf("❌ [lx-go] handler panic recovered (%s %s): %v\n%s", name, r.URL.Path, rec, debug.Stack())
+				http.Error(w, fmt.Sprintf("internal error: %v", rec), http.StatusInternalServerError)
+			}
+		}()
+		h(w, r)
+	}
+}
 
 // searchPool 返回所有为任意平台声明了 search 能力的音源，顺序与 Registry 的
 // 加载顺序（默认优先级）一致。这是 "默认搜索音源" 轮换的候选池。
@@ -98,15 +117,15 @@ func (s *Server) SwitchToNextSearchSource() (previous, current *Source) {
 // mux 上）都可以用这个方法，不用关心具体 handler 叫什么名字。
 func (s *Server) RegisterRoutes(mux *http.ServeMux) {
 	// 兼容 pkg/music（LXClient）期望的 "LX Sync Server" 接口
-	mux.HandleFunc("/api/music/search", s.handleMusicSearch)
-	mux.HandleFunc("/api/music/url", s.handleMusicURL)
-	mux.HandleFunc("/api/music/progress", s.handleMusicProgress)
-	mux.HandleFunc("/api/music/download", s.handleMusicDownload)
-	mux.HandleFunc("/api/music/switch-source", s.handleSwitchSearchSource)
+	mux.HandleFunc("/api/music/search", recoverMiddleware("search", s.handleMusicSearch))
+	mux.HandleFunc("/api/music/url", recoverMiddleware("url", s.handleMusicURL))
+	mux.HandleFunc("/api/music/progress", recoverMiddleware("progress", s.handleMusicProgress))
+	mux.HandleFunc("/api/music/download", recoverMiddleware("download", s.handleMusicDownload))
+	mux.HandleFunc("/api/music/switch-source", recoverMiddleware("switch-source", s.handleSwitchSearchSource))
 
 	// 诊断用
-	mux.HandleFunc("/health", s.handleHealth)
-	mux.HandleFunc("/sources", s.handleSources)
+	mux.HandleFunc("/health", recoverMiddleware("health", s.handleHealth))
+	mux.HandleFunc("/sources", recoverMiddleware("sources", s.handleSources))
 }
 
 // ---------------------------------------------------------------------

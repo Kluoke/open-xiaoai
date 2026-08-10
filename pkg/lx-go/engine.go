@@ -5,7 +5,9 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"runtime/debug"
 	"strings"
 	"sync"
 	"time"
@@ -16,6 +18,23 @@ import (
 	"github.com/dop251/goja_nodejs/eventloop"
 	"github.com/dop251/goja_nodejs/require"
 )
+
+// runOnLoopSafe 是 loop.RunOnLoop 的安全版本：JS 脚本质量参差不齐（很多脚本
+// 大量 `catch (e) {}` 吞异常，一些脚本用字符串而不是 Error 对象 reject），
+// goja 内部的类型断言/转换也可能因为脚本返回了意料之外的值而 panic。
+// 事件循环回调是在专门的 goroutine 里跑的，一旦这里 panic 且没有 recover，
+// 会直接崩掉整个进程，而不是"这一次请求失败"。所有 loop.RunOnLoop 调用都必须
+// 经过这层包装。
+func runOnLoopSafe(loop *eventloop.EventLoop, name string, fn func(vm *goja.Runtime)) {
+	loop.RunOnLoop(func(vm *goja.Runtime) {
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("❌ [lx-go] event loop panic recovered (%s): %v\n%s", name, r, debug.Stack())
+			}
+		}()
+		fn(vm)
+	})
+}
 
 // scriptVersion / scriptEnv 对齐真实 lx-music 客户端注入给自定义音源脚本的
 // `lx.version` / `lx.env`，取一个较新的桌面端版本号，尽量让脚本走"全功能"分支
@@ -76,6 +95,15 @@ func NewEngine(name string, rawScript string) (*Engine, error) {
 	// 在常驻事件循环中完成一次 JS 环境初始化，后续请求通过 RunOnLoop 投递执行。
 	loop.RunOnLoop(func(vm *goja.Runtime) {
 		defer close(e.ready)
+		// 单独处理（而不是走 runOnLoopSafe）是因为这里 panic 时除了要记日志，
+		// 还必须把 e.initErr 设置成非 nil，否则 NewEngine 会把"初始化时 panic
+		// 了"误判成"初始化成功"，返回一个半初始化的 Engine。
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("❌ [lx-go] 音源 %s 初始化 panic: %v\n%s", name, r, debug.Stack())
+				e.initErr = fmt.Errorf("panic during init: %v", r)
+			}
+		}()
 
 		// 启用 require + Buffer + console，尽量对齐真实 Node/lx-music 沙箱，
 		// 兼容脚本里 `typeof Buffer !== 'undefined'`、`console.log(...)` 等写法。
@@ -212,8 +240,8 @@ func requestAsync(vm *goja.Runtime, loop *eventloop.EventLoop, call goja.Functio
 	if str, ok := arg0.(string); ok {
 		urlStr = str
 	} else if obj, ok := arg0.(map[string]interface{}); ok {
-		if u, exists := obj["url"]; exists {
-			urlStr = u.(string)
+		if u, ok := obj["url"].(string); ok {
+			urlStr = u
 		}
 	}
 
@@ -245,9 +273,21 @@ func requestAsync(vm *goja.Runtime, loop *eventloop.EventLoop, call goja.Functio
 
 	// 开启 Go 的异步协程去请求，绝对不能阻塞当前 JS 主线程
 	go func() {
-		req, err := http.NewRequest(method, urlStr, bodyReader)
+		defer func() {
+			if r := recover(); r != nil {
+				log.Printf("❌ [lx-go] request() 异步 goroutine panic recovered: %v\n%s", r, debug.Stack())
+			}
+		}()
+
+		// 用 context 而不是只靠 http.Client.Timeout：这样请求真正超时/被取消时，
+		// 底层连接会被立即中断，不会出现"Go 侧已经不等这个结果了，但 socket
+		// 还在傻等到 Timeout 才断开"的悬空请求。
+		reqCtx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+
+		req, err := http.NewRequestWithContext(reqCtx, method, urlStr, bodyReader)
 		if err != nil {
-			loop.RunOnLoop(func(vm *goja.Runtime) {
+			runOnLoopSafe(loop, "request-error", func(vm *goja.Runtime) {
 				if hasCallback {
 					_, _ = cb(goja.Undefined(), vm.ToValue(map[string]any{"message": err.Error()}), goja.Undefined())
 				}
@@ -264,7 +304,7 @@ func requestAsync(vm *goja.Runtime, loop *eventloop.EventLoop, call goja.Functio
 		resp, err := client.Do(req)
 		if err != nil {
 			// 发生错误，必须通过 RunOnLoop 回传给 reject
-			loop.RunOnLoop(func(vm *goja.Runtime) {
+			runOnLoopSafe(loop, "request-error", func(vm *goja.Runtime) {
 				if hasCallback {
 					_, _ = cb(goja.Undefined(), vm.ToValue(map[string]any{"message": err.Error()}), goja.Undefined())
 				}
@@ -274,10 +314,12 @@ func requestAsync(vm *goja.Runtime, loop *eventloop.EventLoop, call goja.Functio
 		}
 		defer resp.Body.Close()
 
-		bodyBytes, _ := io.ReadAll(resp.Body)
+		// 上游（脚本配置的域名，也可能是被劫持/伪造的域名）返回超大 body 时不能
+		// 无限制读进内存，限制一个足够覆盖正常 JSON/歌曲信息响应的上限。
+		bodyBytes, _ := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes))
 
 		// 成功拿到文本（通常是 JSON 字符串），安全回传给 JS 并唤醒其 await
-		loop.RunOnLoop(func(vm *goja.Runtime) {
+		runOnLoopSafe(loop, "request-success", func(vm *goja.Runtime) {
 			result := map[string]any{
 				"statusCode": resp.StatusCode,
 				"body":       string(bodyBytes),
@@ -292,6 +334,11 @@ func requestAsync(vm *goja.Runtime, loop *eventloop.EventLoop, call goja.Functio
 	return vm.ToValue(promise)
 }
 
+// maxResponseBodyBytes 是 request() 读取上游响应体的硬上限，防止被恶意/异常
+// 的上游拖爆内存。音源脚本请求的都是歌曲搜索/直链这类小体积 JSON 接口，
+// 10MB 绰绰有余。
+const maxResponseBodyBytes = 10 << 20
+
 // Call 调用 JS 导出的事件处理器
 func (e *Engine) Call(ctx context.Context, event string, payload interface{}) (interface{}, error) {
 	// 定义一个包装返回结果的结构体
@@ -302,7 +349,7 @@ func (e *Engine) Call(ctx context.Context, event string, payload interface{}) (i
 	ch := make(chan resultTuple, 1)
 
 	// 必须把执行代码的逻辑推入事件循环线程中运行，以防并发死锁
-	e.loop.RunOnLoop(func(vm *goja.Runtime) {
+	runOnLoopSafe(e.loop, "call:"+event, func(vm *goja.Runtime) {
 		handlerVal, exists := e.handlers[event]
 		if !exists || handlerVal == nil {
 			ch <- resultTuple{nil, fmt.Errorf("事件监听器 [%s] 未注册", event)}
@@ -371,13 +418,16 @@ func formatJSValue(v goja.Value) string {
 	if v == nil || goja.IsUndefined(v) || goja.IsNull(v) {
 		return "unknown error"
 	}
-	if exported := v.Export(); exported != nil {
-		if msg, ok := exported.(map[string]any)["message"]; ok {
-			text := strings.TrimSpace(fmt.Sprint(msg))
-			if text != "" {
+	exported := v.Export()
+	if m, ok := exported.(map[string]any); ok {
+		if msg, ok := m["message"]; ok {
+			if text := strings.TrimSpace(fmt.Sprint(msg)); text != "" {
 				return text
 			}
 		}
+	}
+	if s, ok := exported.(string); ok && s != "" {
+		return s
 	}
 	return v.String()
 }

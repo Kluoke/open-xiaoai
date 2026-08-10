@@ -335,10 +335,31 @@ music:
 - `lx.utils.buffer.from/bufToString`（utf-8/hex/base64 编解码）
 - `lx.utils.crypto.md5/aesEncrypt/aesDecrypt`（部分音源解析网易云 `eapi` 等加密接口时需要用到）
 
+## 健壮性 / 已知问题
+
+因为跑的是别人写的、质量参差不齐的第三方脚本（不少脚本大量 `catch (e) {}` 吞异常、用字符串而不是 `Error` 对象 reject），这里单独记录做过的加固和还没做、有意留着的取舍，方便以后审计。
+
+**已修复：**
+
+- **`formatJSValue` 的不安全类型断言（曾经能直接 panic 崩进程）**：脚本用 `Promise.reject('一个字符串')` 而不是 `reject(new Error(...))` 时，之前 `exported.(map[string]any)["message"]` 会因为单值类型断言失败直接 panic；而且这是在事件循环专用 goroutine 里，没有 recover 就是整个进程崩掉。已经改成安全的 `, ok` 断言，见 `panic_safety_test.go` 里的回归测试（这个测试在修复前是真的会让 `go test` 直接崩溃退出的，不是断言失败那种普通 FAIL）。
+- **`request()` 里 `u.(string)` 同类问题**：`request({url: 123}, ...)` 这种 url 字段不是字符串的畸形调用，之前直接 panic，现在安全降级成"URL 为空"的普通错误。
+- **全局 panic 兜底**：事件循环里所有 `loop.RunOnLoop` 回调（`runOnLoopSafe`）和所有 HTTP handler（`recoverMiddleware`）都包了 recover，JS 侧或 goja 内部任何意外 panic 现在只会让"这一次请求"失败，不会波及其它正在处理的请求，更不会崩掉整个进程。
+- **上游响应体大小限制**：`request()` 读取上游响应体时套了 `io.LimitReader`（10MB 上限），不会因为脚本请求的域名被劫持/伪造返回超大 body 就把内存吃爆。
+- **请求真正跟着超时/取消走**：`request()` 底层改用 `http.NewRequestWithContext` 绑定一个 `context.WithTimeout`，超时后连接会被立即中断，不会出现"Go 侧已经不等结果了，但 socket 还在傻等自己的 Timeout 才断开"的悬空请求。
+- **cache 后台清理**：`/api/music/search`、`/api/music/url` 的响应缓存之前只有"命中同一个 key 再查询"才会顺手清理过期项，从未被再次访问的 key 会一直占着内存不释放；现在加了一个后台 goroutine（`cacheSweepInterval`，1 分钟一次）定期清理过期条目。
+- **独立服务模式（`cmd/lxgo-server`）优雅关闭**：之前 `http.ListenAndServe` 永久阻塞，外面的 `defer registry.Close()` 永远没机会跑，进程被杀的时候每个音源脚本的 goja 事件循环根本没被正常停掉。现在监听 `SIGINT`/`SIGTERM`，收到信号后 `http.Server.Shutdown()` + 各个 `defer` 都能正常跑完。
+- **`writeJSON` 的 encode 错误不再被静默吞掉**：会记日志，方便排查"客户端收到截断 JSON"这类问题。
+
+**有意留着、没有修的（工程取舍，不是漏掉了）：**
+
+- **接口没有鉴权/限流**：`/api/music/*`、`/health`、`/sources` 目前都是裸奔的。这是按"内嵌到 `pkg/music` 进程里、或者部署在你自己的内网/回环地址"这个使用场景设计的——内嵌模式（推荐用法，见下面"接入 pkg/music"）甚至完全不经过网络。如果你要把 `cmd/lxgo-server` 单独暴露到公网/不受信任的网络，请自己在前面套一层 nginx/Caddy 做 IP 白名单或限流，或者提个 issue 我们再加。
+- **单个音源脚本内部仍是单线程（一个 goja Runtime 配一个 eventloop）**：goja 的 `Runtime` 本身就不是并发安全的，这个限制没法绕开。不过现在的多音源设计下，每个脚本都是独立的 `Engine`/`eventloop`，不同音源之间天然并行，一个源卡住不会拖慢其它源——比最早"单一引擎，所有平台挤在一个 eventloop 里排队"的设计已经好不少。真要继续加吞吐量，思路是给同一个脚本也搞个"多实例池 + round-robin"，目前没做。
+- **`Registry.Search`/`ResolveURL` 里 `Engine.Call` 用的 `context.WithTimeout(r.Context(), sourceRequestTime)` 没有单独做"外层 HTTP 请求已经断开就立刻取消当前 JS 执行"的强联动**：`request()` 内部的网络请求已经绑定了自己的超时 context（见上面"已修复"），但如果调用方在 JS 脚本执行到一半（不是在等网络 IO，而是在跑同步逻辑）就断开连接，这段 JS 计算不会被强行打断——goja 本身不支持从外部中断正在执行的同步代码。实际影响很小：音源脚本里耗时的部分几乎都是等网络 IO（已经有超时保护），纯计算部分都很快。
+
 ## 开发/测试
 
 ```bash
 go test ./...
 ```
 
-`api_test.go` / `engine_test.go` / `registry_test.go` / `switch_source_test.go` 都是纯本地测试，不依赖网络。如果想验证真实的、放在 `js/` 目录下的音源脚本（包括启动自检的真实网络行为），可以自己写一个临时测试直接调用 `LoadSources("./js")`，观察日志输出即可；不想真的发网络请求时可以设置 `LX_GO_SKIP_SELFTEST=1` 跳过启动自检。
+`api_test.go` / `engine_test.go` / `registry_test.go` / `switch_source_test.go` / `panic_safety_test.go` 都是纯本地测试，不依赖网络。如果想验证真实的、放在 `js/` 目录下的音源脚本（包括启动自检的真实网络行为），可以自己写一个临时测试直接调用 `LoadSources("./js")`，观察日志输出即可；不想真的发网络请求时可以设置 `LX_GO_SKIP_SELFTEST=1` 跳过启动自检。
