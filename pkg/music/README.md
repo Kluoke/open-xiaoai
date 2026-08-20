@@ -471,7 +471,7 @@ music:
     enabled: true
     embedded: true
     embedded_js_dir: "../lx-go/js"   # 指向音源脚本（可以多个）目录，相对/绝对路径都行
-     download: false            # 普通播放不下载；说“下载歌曲”时才保存
+    download: false            # 普通播放不下载；说“下载歌曲”时才保存
     download_dir: ""  # 空则下载到 music.dirs[0]
     source: "wy"
     quality: "128k"
@@ -492,7 +492,7 @@ music:
   lx:
     enabled: true
     base_url: "http://127.0.0.1:8080"   # pkg/lx-go 默认端口，和 music 自己的文件服务端口 18080 不冲突
-     download: false            # 普通播放不下载；说“下载歌曲”时才保存
+    download: false            # 普通播放不下载；说“下载歌曲”时才保存
     download_dir: ""  # 空则下载到 music.dirs[0]
     source: "wy"
     quality: "128k"
@@ -520,7 +520,7 @@ music:
     base_url: "http://localhost:9527"
     username: "your_lx_user"
     password: "your_lx_password"
-     download: false            # 普通播放不下载；说“下载歌曲”时才保存
+    download: false            # 普通播放不下载；说“下载歌曲”时才保存
     download_dir: ""  # 空则下载到 music.dirs[0]
     source: "kw"
     quality: "128k"

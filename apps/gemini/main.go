@@ -16,8 +16,9 @@ import (
 // 大部分音频早已被喇叭播过了，此时只剩"最后几个 chunk + ALSA 缓冲"还没播完。
 //
 // 正确公式：
-//   未播秒数 = max(0, 总音频时长 - 从首帧到现在已过的时间)
-//   解禁延时 = 未播秒数 + 安全余量（覆盖 WS/ALSA 缓冲）
+//
+//	未播秒数 = max(0, 总音频时长 - 从首帧到现在已过的时间)
+//	解禁延时 = 未播秒数 + 安全余量（覆盖 WS/ALSA 缓冲）
 //
 // 例：AI 在 N 秒内边发边播，turn_complete 时早就播了 N-0.x 秒，
 // 我们只需要再等 ~0.x 秒 + guard，而不是整段 N 秒。
@@ -61,12 +62,13 @@ func markFirstAudio() {
 // onTurnFinished 在服务端 turn_complete 时调用：估算"还有多少音频没播完"再解禁。
 //
 // 时序示意（数字仅为示例）：
-//   t=0.0s   AI 第一个 chunk 到达       → 喇叭开始播
-//   t=0~9.5s 边收边播（流式）
-//   t=9.5s   turn_complete             → 总下发字节折算 10.0s 音频
-//                                        已过 9.5s，剩 0.5s 没播
-//   sleep   0.5s + guard(600ms)
-//   t=10.6s 解禁 mic
+//
+//	t=0.0s   AI 第一个 chunk 到达       → 喇叭开始播
+//	t=0~9.5s 边收边播（流式）
+//	t=9.5s   turn_complete             → 总下发字节折算 10.0s 音频
+//	                                     已过 9.5s，剩 0.5s 没播
+//	sleep   0.5s + guard(600ms)
+//	t=10.6s 解禁 mic
 //
 // 如果在等待期间又开了新的 turn（turnGen 变化），就放弃这次解禁。
 func onTurnFinished() {
@@ -195,4 +197,3 @@ func main() {
 	log.Printf("   打断: ✋ 半双工模式，AI 说话期间无法打断")
 	wg.Wait()
 }
-

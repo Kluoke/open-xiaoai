@@ -183,11 +183,11 @@ type Player struct {
 // NewPlayer 创建播放器
 func NewPlayer(fs *FileServer, idx *Indexer, opts ...PlayerOption) *Player {
 	p := &Player{
-		fileServer:      fs,
-		indexer:         idx,
-		initialStateCh:  make(chan struct{}),
-		watchdogEnabled: true,
-		preemptMargin:   defaultPreemptMargin,
+		fileServer:                fs,
+		indexer:                   idx,
+		initialStateCh:            make(chan struct{}),
+		watchdogEnabled:           true,
+		preemptMargin:             defaultPreemptMargin,
 		announceEpisodeBeforePlay: true,
 	}
 	for _, opt := range opts {

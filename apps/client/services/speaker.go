@@ -250,8 +250,9 @@ func (s *Speaker) PlayerOperationPrevious() (bool, error) {
 // name 是不含目录的文件名，如 "welcome.opus"。
 //
 // 用途示例：
-//   s.PlayLocalSound("/usr/share/common_sound/", "welcome.opus") // 欢迎语
-//   s.PlayLocalSound("/usr/share/sound/", "wifi_disconnect.opus") // 断网提示
+//
+//	s.PlayLocalSound("/usr/share/common_sound/", "welcome.opus") // 欢迎语
+//	s.PlayLocalSound("/usr/share/sound/", "wifi_disconnect.opus") // 断网提示
 //
 // 来源：wakeup.sh 的多个 case（welcome / wifi_disconnect / mibrain_* / upgrade_* / wuw_tips 等）。
 func (s *Speaker) PlayLocalSound(dir, name string) (bool, error) {

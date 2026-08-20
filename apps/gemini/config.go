@@ -100,4 +100,3 @@ func (c *AppConfig) GetAPIKey() string {
 	}
 	return ""
 }
-

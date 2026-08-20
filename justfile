@@ -14,7 +14,7 @@ format:
     for dir in apps/client apps/chat apps/gemini pkg/music tools/client-patch; do
         if [ -d "$dir" ]; then
             echo "==> $dir"
-            (cd "$dir" && go fmt ./... && goimports -w .)
+            (cd "$dir" && go mod tidy && go fmt ./... && goimports -w .)
         fi
     done
 

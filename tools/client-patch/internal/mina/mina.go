@@ -8,10 +8,10 @@ import (
 	"net/url"
 	"strings"
 	"time"
+	"uuid"
 
 	"github.com/cxjava/open-xiaoai/tools/client-patch/internal/account"
 	"github.com/cxjava/open-xiaoai/tools/client-patch/internal/logger"
-	"github.com/google/uuid"
 )
 
 const minaAPI = "https://api2.mina.mi.com"

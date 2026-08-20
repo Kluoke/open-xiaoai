@@ -3,8 +3,7 @@ package connect
 import (
 	"encoding/json"
 	"fmt"
-
-	"github.com/google/uuid"
+	"uuid"
 )
 
 // AppMessage is the top-level tagged enum for WebSocket text messages.
@@ -71,7 +70,7 @@ type Event struct {
 
 func NewEvent(event string, data *json.RawMessage) Event {
 	return Event{
-		ID:    uuid.NewString(),
+		ID:    uuid.New().String(),
 		Event: event,
 		Data:  data,
 	}
@@ -86,7 +85,7 @@ type Stream struct {
 
 func NewStream(tag string, bytes []byte, data *json.RawMessage) Stream {
 	return Stream{
-		ID:    uuid.NewString(),
+		ID:    uuid.New().String(),
 		Tag:   tag,
 		Bytes: bytes,
 		Data:  data,

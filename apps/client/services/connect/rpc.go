@@ -6,8 +6,7 @@ import (
 	"log"
 	"sync"
 	"time"
-
-	"github.com/google/uuid"
+	"uuid"
 )
 
 type RequestHandler func(req Request) (Response, error)
@@ -98,7 +97,7 @@ func (r *RPC) CallRemote(command string, payload interface{}, timeoutMs *uint64)
 		return Response{}, fmt.Errorf("sendRequest is not initialized")
 	}
 
-	uid := uuid.NewString()
+	uid := uuid.New().String()
 	ch := make(chan Response, 1)
 
 	var payloadRaw *json.RawMessage

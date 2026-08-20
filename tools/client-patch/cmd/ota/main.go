@@ -6,8 +6,8 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"uuid"
 
-	"github.com/google/uuid"
 	"github.com/joho/godotenv"
 
 	"github.com/cxjava/open-xiaoai/tools/client-patch/internal/account"
