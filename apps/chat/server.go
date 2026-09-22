@@ -146,6 +146,9 @@ func initConnection(conn *websocket.Conn, r *http.Request, app *appRuntime) {
 	connect.GetHandlers().SetStreamHandler(func(stream connect.Stream) error {
 		if stream.Tag == "record" {
 			log.Printf("🎤 收到录音: %d bytes", len(stream.Bytes))
+			if sipManager := app.SIPManager(); sipManager != nil {
+				return sipManager.WriteSpeakerPCM(stream.Bytes)
+			}
 		}
 		return nil
 	})
