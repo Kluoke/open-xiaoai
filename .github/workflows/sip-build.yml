@@ -23,6 +23,10 @@ jobs:
         working-directory: apps/chat
         run: go mod tidy
 
+      - name: Show module diff
+        working-directory: apps/chat
+        run: git diff -- go.mod go.sum
+
       - name: Test
         working-directory: apps/chat
         run: go test ./...
