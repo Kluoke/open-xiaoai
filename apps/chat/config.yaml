@@ -57,14 +57,13 @@ call_ai_keywords:
 
 # 本地 SIP 电话路由
 # 只有“通话关键词 + 本地 SIP 联系人”同时匹配时才接管。
-# 联系人匹配不到时不会打断小爱，继续走小爱原生电话能力。
+# 联系人明确指定走 linphone 或 asterisk：
+#   linphone: 直接呼叫 sip.linphone.org，不经过本地 Asterisk
+#   asterisk: 呼叫本机 Asterisk 内部分机，再由 Asterisk/Air780 决定最终手机号码
 sip:
   enabled: false
   bind_host: "0.0.0.0"
   bind_port: 5062
-  username: ""
-  password: ""
-  caller_name: "小爱"
   call_timeout_sec: 45
   call_keywords:
     - "打电话"
@@ -77,12 +76,34 @@ sip:
     - "挂电话"
     - "结束通话"
     - "结束电话"
+
+  # 直接连接 Linphone 官方 SIP 服务的账号
+  # 不要把密码提交到 Git；部署时填入实际值。
+  linphone:
+    username: "your-linphone-username"
+    password: "your-linphone-password"
+    caller_name: "小爱"
+
+  # 本地 Asterisk PJSIP endpoint 的账号
+  asterisk:
+    username: "xiaoai"
+    password: "your-asterisk-password"
+    caller_name: "小爱"
+
   contacts:
-    # 推荐全部指向本机 Asterisk 分机，由 Asterisk 决定最终目标。
-    # 例如：
-    # 客厅音响: "sip:601@192.168.200.128:5060"
-    # Air780: "sip:602@192.168.200.128:5060"
-    # 我的手机: "sip:603@192.168.200.128:5060"
+    # SIP 用户：chat-go 直接发 INVITE 到 Linphone 官方后台
+    我的手机:
+      via: "linphone"
+      uri: "sip:kotlin@sip.linphone.org"
+
+    # SIM 联系人：只把 Asterisk 内部分机号交给 Asterisk。
+    # 手机号码应维护在 Asterisk 的拨号规则/配置里，不写在 chat-go。
+    张三:
+      via: "asterisk"
+      uri: "sip:601@192.168.200.128:5060"
+    李四:
+      via: "asterisk"
+      uri: "sip:602@192.168.200.128:5060"
 
 # 连接成功后播放的提示语
 greeting: "已连接"
