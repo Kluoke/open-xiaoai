@@ -72,24 +72,34 @@ func (r *SIPRouter) HandleInstruction(text string, abort func() error) bool {
 		}
 	}
 	if bestContact != "" {
-		contact, uri := bestContact, bestURI {
-			if err := abort(); err != nil {
-				log.Printf("⚠️ SIP 拨号前打断小爱失败: %v", err)
-			}
-			if r.onDial == nil {
-				log.Printf("⚠️ SIP 联系人已匹配但尚未配置 SIP UA: %s -> %s", contact, uri)
-				return true
-			}
-			if err := r.onDial(SIPRoute{URI: uri, Contact: contact}); err != nil {
-				log.Printf("❌ SIP 拨号失败: %v", err)
-				return true
-			}
-			r.mu.Lock()
-			r.active = true
-			r.mu.Unlock()
-			log.Printf("☎️ SIP 拨号: %s -> %s", contact, uri)
+		contact, uri := bestContact, bestURI
+		if err := abort(); err != nil {
+			log.Printf("⚠️ SIP 拨号前打断小爱失败: %v", err)
+		}
+		if r.onDial == nil {
+			log.Printf("⚠️ SIP 联系人已匹配但尚未配置 SIP UA: %s -> %s", contact, uri)
 			return true
 		}
+
+		r.mu.Lock()
+		if r.active {
+			r.mu.Unlock()
+			return true
+		}
+		// Reserve the route before starting the blocking SIP INVITE so a second
+		// ASR event cannot start another call while the first one is ringing.
+		r.active = true
+		r.mu.Unlock()
+
+		go func() {
+			if err := r.onDial(SIPRoute{URI: uri, Contact: contact}); err != nil {
+				log.Printf("❌ SIP 拨号失败: %v", err)
+				r.EndCall()
+				return
+			}
+			log.Printf("☎️ SIP 拨号: %s -> %s", contact, uri)
+		}()
+		return true
 	}
 
 	return false
@@ -109,4 +119,10 @@ func (r *SIPRouter) matchesAny(text string, keywords []string) bool {
 		}
 	}
 	return false
+}
+
+func (r *SIPRouter) EndCall() {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.active = false
 }
