@@ -83,12 +83,14 @@ sip:
     username: "your-linphone-username"
     password: "your-linphone-password"
     caller_name: "小爱"
+    domain: "sip.linphone.org"
 
   # 本地 Asterisk PJSIP endpoint 的账号
   asterisk:
     username: "xiaoai"
     password: "your-asterisk-password"
     caller_name: "小爱"
+    domain: "192.168.200.128"
 
   contacts:
     # SIP 用户：chat-go 直接发 INVITE 到 Linphone 官方后台
