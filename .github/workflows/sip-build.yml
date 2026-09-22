@@ -19,9 +19,9 @@ jobs:
           go-version-file: apps/chat/go.mod
           cache-dependency-path: apps/chat/go.sum
 
-      - name: Download modules
+      - name: Tidy modules
         working-directory: apps/chat
-        run: go mod download
+        run: go mod tidy
 
       - name: Test
         working-directory: apps/chat
