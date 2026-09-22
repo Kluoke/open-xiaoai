@@ -143,6 +143,9 @@ func (e *Engine) handleInstruction(data []byte) {
 
 	text := msg.Payload.Results[0].Text
 	log.Printf("🗣️ 用户: %s", text)
+	if e.sipRouter != nil && e.sipRouter.HandleInstruction(text, e.speaker.AbortXiaoAI) {
+		return
+	}
 	cfg := e.Config()
 	decision, keyword := cfg.instructionDecision(text)
 	switch decision {
