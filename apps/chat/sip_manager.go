@@ -111,6 +111,11 @@ func (m *SIPManager) Dial(route SIPRoute) error {
 	}
 
 	cfg := m.cfg()
+	account, err := cfg.accountForRoute(route.Via)
+	if err != nil {
+		return err
+	}
+
 	timeout := time.Duration(cfg.CallTimeoutSec) * time.Second
 	if timeout <= 0 {
 		timeout = 45 * time.Second
@@ -139,12 +144,12 @@ func (m *SIPManager) Dial(route SIPRoute) error {
 	}()
 
 	var headers []sip.Header
-	if cfg.Username != "" {
+	if account.Username != "" {
 		headers = append(headers, &sip.FromHeader{
-			DisplayName: cfg.CallerName,
+			DisplayName: account.CallerName,
 			Address: sip.Uri{
 				Scheme: "sip",
-				User:   cfg.Username,
+				User:   account.Username,
 				Host:   normalizeBindHost(cfg.BindHost),
 			},
 			Params: sip.NewParams(),
@@ -153,8 +158,8 @@ func (m *SIPManager) Dial(route SIPRoute) error {
 
 	dialog, err := m.diago.Invite(ctx, target, diago.InviteOptions{
 		Transport:  transport,
-		Username:   cfg.Username,
-		Password:   cfg.Password,
+		Username:   account.Username,
+		Password:   account.Password,
 		Headers:    headers,
 		OnResponse: func(res *sip.Response) error {
 			log.Printf("☎️ SIP 响应: %d -> %s", res.StatusCode, route.URI)
@@ -209,7 +214,7 @@ func (m *SIPManager) Dial(route SIPRoute) error {
 		m.clearCall(call)
 	}()
 
-	log.Printf("☎️ SIP 已建立: %s -> %s", route.Contact, route.URI)
+	log.Printf("☎️ SIP 已建立: %s -> %s -> %s", route.Contact, route.Via, route.URI)
 	return nil
 }
 
