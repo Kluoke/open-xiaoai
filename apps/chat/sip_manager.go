@@ -157,7 +157,7 @@ func (m *SIPManager) Dial(route SIPRoute) error {
 		Password:   cfg.Password,
 		Headers:    headers,
 		OnResponse: func(res *sip.Response) error {
-			log.Printf("☎️ SIP 响应: %d %s -> %s", res.StatusCode, route.URI, res.Reason)
+			log.Printf("☎️ SIP 响应: %d -> %s", res.StatusCode, route.URI)
 			return nil
 		},
 	})
