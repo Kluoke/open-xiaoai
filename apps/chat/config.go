@@ -82,6 +82,12 @@ var defaultInterruptKeywords = []string{"闭嘴", "停止", "暂停", "停一下
 // matches, the instruction is left untouched so XiaoAI can handle it natively.
 type SIPConfig struct {
 	Enabled        bool              `yaml:"enabled"`
+	BindHost       string            `yaml:"bind_host"`
+	BindPort       int               `yaml:"bind_port"`
+	Username       string            `yaml:"username"`
+	Password       string            `yaml:"password"`
+	CallerName     string            `yaml:"caller_name"`
+	CallTimeoutSec int               `yaml:"call_timeout_sec"`
 	CallKeywords   []string          `yaml:"call_keywords"`
 	HangupKeywords []string          `yaml:"hangup_keywords"`
 	Contacts       map[string]string `yaml:"contacts"`
