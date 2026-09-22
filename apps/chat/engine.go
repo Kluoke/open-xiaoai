@@ -24,6 +24,7 @@ type Engine struct {
 	config   *AppConfig
 	speaker  *Speaker
 	client   *openai.Client
+	sipRouter *SIPRouter
 
 	mu         sync.Mutex
 	cancelFunc context.CancelFunc
@@ -69,6 +70,12 @@ func (e *Engine) UpdateConfig(cfg *AppConfig) {
 	e.configMu.Lock()
 	defer e.configMu.Unlock()
 	e.config = cfg
+}
+
+func (e *Engine) SetSIPRouter(r *SIPRouter) {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.sipRouter = r
 }
 
 // --- Event parsing (from xiaoai.ts onEvent) ---
@@ -136,6 +143,9 @@ func (e *Engine) handleInstruction(data []byte) {
 
 	text := msg.Payload.Results[0].Text
 	log.Printf("🗣️ 用户: %s", text)
+	if e.sipRouter != nil && e.sipRouter.HandleInstruction(text, e.speaker.AbortXiaoAI) {
+		return
+	}
 	cfg := e.Config()
 	decision, keyword := cfg.instructionDecision(text)
 	switch decision {

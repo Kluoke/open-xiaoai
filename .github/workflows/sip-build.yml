@@ -1,0 +1,36 @@
+name: SIP build
+
+on:
+  push:
+    branches:
+      - feature/xiaoai-sip-routing
+  pull_request:
+    branches:
+      - main
+
+jobs:
+  chat:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: apps/chat/go.mod
+          cache-dependency-path: apps/chat/go.sum
+
+      - name: Tidy modules
+        working-directory: apps/chat
+        run: go mod tidy
+
+      - name: Show module diff
+        working-directory: apps/chat
+        run: git diff -- go.mod go.sum
+
+      - name: Test
+        working-directory: apps/chat
+        run: go test ./...
+
+      - name: Build
+        working-directory: apps/chat
+        run: go build ./...

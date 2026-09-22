@@ -15,6 +15,7 @@ type appRuntime struct {
 	engine             *Engine
 	speaker            *Speaker
 	musicModule        *music.Module
+	sipManager         *SIPManager
 	lastConnectionHost string
 }
 
@@ -25,6 +26,18 @@ func newAppRuntime(configPath string, cfg *AppConfig, speaker *Speaker, engine *
 		speaker:    speaker,
 		engine:     engine,
 	}
+}
+
+func (a *appRuntime) SetSIPManager(manager *SIPManager) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	a.sipManager = manager
+}
+
+func (a *appRuntime) SIPManager() *SIPManager {
+	a.mu.RLock()
+	defer a.mu.RUnlock()
+	return a.sipManager
 }
 
 func (a *appRuntime) Config() *AppConfig {
@@ -142,5 +155,9 @@ func configRequiresRestart(oldConfig, newConfig *AppConfig) bool {
 	}
 	return oldConfig.Server != newConfig.Server ||
 		oldConfig.Proxy != newConfig.Proxy ||
-		oldConfig.LLM != newConfig.LLM
+		oldConfig.LLM != newConfig.LLM ||
+		oldConfig.SIP.BindHost != newConfig.SIP.BindHost ||
+		oldConfig.SIP.BindPort != newConfig.SIP.BindPort ||
+		oldConfig.SIP.Linphone != newConfig.SIP.Linphone ||
+		oldConfig.SIP.Asterisk != newConfig.SIP.Asterisk
 }
