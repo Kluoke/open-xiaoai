@@ -60,6 +60,12 @@ call_ai_keywords:
 # 联系人匹配不到时不会打断小爱，继续走小爱原生电话能力。
 sip:
   enabled: false
+  bind_host: "0.0.0.0"
+  bind_port: 5062
+  username: ""
+  password: ""
+  caller_name: "小爱"
+  call_timeout_sec: 45
   call_keywords:
     - "打电话"
     - "拨电话"
@@ -73,6 +79,7 @@ sip:
     - "结束电话"
   contacts:
     # 客厅音响: "sip:livingroom@192.168.200.128"
+    # Air780: "sip:air780@192.168.200.128:5060"
     # 卧室音响: "sip:bedroom@192.168.200.128"
 
 # 连接成功后播放的提示语
