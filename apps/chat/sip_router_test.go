@@ -12,9 +12,10 @@ func testSIPConfig() SIPConfig {
 		Enabled:        true,
 		CallKeywords:   []string{"打电话", "拨打"},
 		HangupKeywords: []string{"挂断电话", "挂电话"},
-		Contacts: map[string]string{
-			"客厅":     "sip:601@192.168.200.128:5060",
-			"客厅音响": "sip:602@192.168.200.128:5060",
+		Contacts: map[string]SIPContact{
+			"客厅":     {Via: "asterisk", URI: "sip:601@192.168.200.128:5060"},
+			"客厅音响": {Via: "asterisk", URI: "sip:602@192.168.200.128:5060"},
+			"手机":     {Via: "linphone", URI: "sip:kotlin@sip.linphone.org"},
 		},
 	}
 }
@@ -26,7 +27,7 @@ func TestSIPRouterOnlyInterceptsConfiguredContact(t *testing.T) {
 		testSIPConfig,
 		func(route SIPRoute) error {
 			dialed.Add(1)
-			if route.Contact != "客厅音响" || route.URI != "sip:602@192.168.200.128:5060" {
+			if route.Contact != "客厅音响" || route.Via != "asterisk" || route.URI != "sip:602@192.168.200.128:5060" {
 				return errors.New("wrong route")
 			}
 			return nil
@@ -68,7 +69,10 @@ func TestSIPRouterConsumesInCallInstructionAndHandlesHangup(t *testing.T) {
 	var hungUp atomic.Int32
 	r := NewSIPRouter(
 		testSIPConfig,
-		func(SIPRoute) error {
+		func(route SIPRoute) error {
+			if route.Contact != "客厅" || route.Via != "asterisk" {
+				return errors.New("wrong Asterisk route")
+			}
 			return nil
 		},
 		func() error {
@@ -123,6 +127,32 @@ func TestParseSIPURI(t *testing.T) {
 	}
 	if transport != "udp" {
 		t.Fatalf("unexpected transport: %q", transport)
+	}
+}
+
+func TestSIPRouterSelectsDirectLinphoneRoute(t *testing.T) {
+	var dialed atomic.Int32
+	r := NewSIPRouter(
+		testSIPConfig,
+		func(route SIPRoute) error {
+			dialed.Add(1)
+			if route.Contact != "手机" || route.Via != "linphone" || route.URI != "sip:kotlin@sip.linphone.org" {
+				return errors.New("wrong Linphone route")
+			}
+			return nil
+		},
+		nil,
+	)
+
+	if handled := r.HandleInstruction("给手机打电话", func() error { return nil }); !handled {
+		t.Fatal("Linphone contact should be intercepted")
+	}
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for dialed.Load() == 0 && time.Now().Before(deadline) {
+		time.Sleep(5 * time.Millisecond)
+	}
+	if dialed.Load() != 1 {
+		t.Fatalf("expected one Linphone dial, got %d", dialed.Load())
 	}
 }
 
