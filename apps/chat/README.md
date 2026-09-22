@@ -112,6 +112,62 @@ http://你的IP:4399/admin
 
 SIP 媒体侧固定优先协商 PCMA/PCMU。音箱端保持现有 16 kHz / 16-bit / mono PCM，不在音箱上运行 SIP UA。
 
+### 配合 Asterisk
+
+推荐把联系人都指向本机 Asterisk 的分机，不让音箱直接管理 Air780 号码路由。这样后续可以由 Asterisk 统一决定是呼叫 Air780、Linphone/Yak，还是其他 SIP 终端。
+
+例如服务端使用：
+
+```yaml
+sip:
+  enabled: true
+  bind_host: "0.0.0.0"
+  bind_port: 5062
+  username: "xiaoai"
+  password: "your-password"
+  caller_name: "小爱"
+```
+
+Asterisk 对应建立一个 `xiaoai` PJSIP endpoint，并在该 endpoint 的 context 中做分机路由：
+
+```ini
+[xiaoai-auth]
+type=auth
+auth_type=userpass
+username=xiaoai
+password=your-password
+
+[xiaoai-aor]
+type=aor
+max_contacts=1
+remove_existing=yes
+
+[xiaoai]
+type=endpoint
+transport=transport-udp
+context=from-xiaoai
+disallow=all
+allow=alaw
+allow=ulaw
+auth=xiaoai-auth
+aors=xiaoai-aor
+identify_by=username,ip
+
+[from-xiaoai]
+exten => 601,1,Dial(PJSIP/air780,60)
+exten => 602,1,Dial(PJSIP/linphone-out,60)
+```
+
+于是联系人可以配置成：
+
+```yaml
+contacts:
+  Air780: "sip:601@192.168.200.128:5060"
+  我的手机: "sip:602@192.168.200.128:5060"
+```
+
+这里 `601`、`602` 只是 Asterisk 内部分机号。Air780 真正要拨打外部手机号时，再由 Asterisk/Air780 的下一层拨号逻辑处理。
+
 示例：
 
 ```yaml
