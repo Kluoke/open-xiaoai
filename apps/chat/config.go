@@ -80,17 +80,38 @@ var defaultInterruptKeywords = []string{"闭嘴", "停止", "暂停", "停一下
 // SIPConfig controls local SIP call routing. A call is intercepted only when
 // both a call keyword and a configured contact name are matched. If no contact
 // matches, the instruction is left untouched so XiaoAI can handle it natively.
+type SIPAccount struct {
+	Username   string `yaml:"username"`
+	Password   string `yaml:"password"`
+	CallerName string `yaml:"caller_name"`
+}
+
+type SIPContact struct {
+	Via string `yaml:"via"` // linphone or asterisk
+	URI string `yaml:"uri"`
+}
+
 type SIPConfig struct {
-	Enabled        bool              `yaml:"enabled"`
-	BindHost       string            `yaml:"bind_host"`
-	BindPort       int               `yaml:"bind_port"`
-	Username       string            `yaml:"username"`
-	Password       string            `yaml:"password"`
-	CallerName     string            `yaml:"caller_name"`
-	CallTimeoutSec int               `yaml:"call_timeout_sec"`
-	CallKeywords   []string          `yaml:"call_keywords"`
-	HangupKeywords []string          `yaml:"hangup_keywords"`
-	Contacts       map[string]string `yaml:"contacts"`
+	Enabled        bool                 `yaml:"enabled"`
+	BindHost       string               `yaml:"bind_host"`
+	BindPort       int                  `yaml:"bind_port"`
+	CallTimeoutSec int                  `yaml:"call_timeout_sec"`
+	CallKeywords   []string             `yaml:"call_keywords"`
+	HangupKeywords []string             `yaml:"hangup_keywords"`
+	Linphone       SIPAccount           `yaml:"linphone"`
+	Asterisk       SIPAccount           `yaml:"asterisk"`
+	Contacts       map[string]SIPContact `yaml:"contacts"`
+}
+
+func (c SIPConfig) accountForRoute(via string) (SIPAccount, error) {
+	switch strings.ToLower(strings.TrimSpace(via)) {
+	case "linphone":
+		return c.Linphone, nil
+	case "asterisk":
+		return c.Asterisk, nil
+	default:
+		return SIPAccount{}, fmt.Errorf("unsupported SIP route %q; expected linphone or asterisk", via)
+	}
 }
 
 func defaultSIPConfig() SIPConfig {
@@ -100,7 +121,7 @@ func defaultSIPConfig() SIPConfig {
 		CallTimeoutSec: 45,
 		CallKeywords:   []string{"打电话", "拨电话", "拨打", "呼叫", "联系"},
 		HangupKeywords: []string{"挂断电话", "挂电话", "结束通话", "结束电话"},
-		Contacts:       map[string]string{},
+		Contacts:       map[string]SIPContact{},
 	}
 }
 
