@@ -55,15 +55,24 @@ func (r *SIPRouter) HandleInstruction(text string, abort func() error) bool {
 	}
 
 	if active {
-		return false
+		// During an active SIP call, consume all ASR commands locally except hangup.
+		return true
 	}
 
 	if !r.matchesAny(text, cfg.CallKeywords) {
 		return false
 	}
 
+	bestContact := ""
+	bestURI := ""
 	for contact, uri := range cfg.Contacts {
-		if strings.Contains(text, contact) {
+		if strings.Contains(text, contact) && len([]rune(contact)) > len([]rune(bestContact)) {
+			bestContact = contact
+			bestURI = uri
+		}
+	}
+	if bestContact != "" {
+		contact, uri := bestContact, bestURI {
 			if err := abort(); err != nil {
 				log.Printf("⚠️ SIP 拨号前打断小爱失败: %v", err)
 			}
