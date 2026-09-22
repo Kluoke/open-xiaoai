@@ -105,37 +105,92 @@ http://你的IP:4399/admin
 启用后，音箱说：
 
 ```text
-给客厅音响打电话
+给张三打电话
 ```
 
-服务端会先匹配 `sip.call_keywords`，再匹配 `sip.contacts`。只有两者都命中才会调用 `AbortXiaoAI()` 并进入 SIP 呼叫；例如“给张三打电话”但 `张三` 不在 `sip.contacts` 时，不会打断小爱原生电话能力。
+服务端会先匹配 `sip.call_keywords`，再匹配 `sip.contacts`。只有“通话关键词 + 联系人”同时命中才会接管；未匹配的联系人不会调用 `AbortXiaoAI()`，继续走小爱原生电话能力。
+
+联系人不是把“联系人名字”直接传给 SIP 服务，而是在 chat-go 本地把联系人解析成一个明确的 SIP 路由：
+
+- `via: linphone`：chat-go 直接呼叫 `sip.linphone.org`，不经过本地 Asterisk。
+- `via: asterisk`：chat-go 只呼叫 Asterisk 的内部 SIP 分机，例如 `601`；Asterisk 再把这个内部号码映射到固定的 Air780/SIM 外拨目标。
 
 SIP 媒体侧固定优先协商 PCMA/PCMU。音箱端保持现有 16 kHz / 16-bit / mono PCM，不在音箱上运行 SIP UA。
 
-### 配合 Asterisk
+### 两条电话线路
 
-推荐把联系人都指向本机 Asterisk 的分机，不让音箱直接管理 Air780 号码路由。这样后续可以由 Asterisk 统一决定是呼叫 Air780、Linphone/Yak，还是其他 SIP 终端。
+```text
+Linphone 路线：
 
-例如服务端使用：
+小爱
+  ↓ WebSocket
+chat-go
+  ↓ SIP/RTP
+sip.linphone.org
+  ↓
+Linphone/Yak 等 SIP 用户
+
+
+Asterisk / SIM 路线：
+
+小爱
+  ↓ WebSocket
+chat-go
+  ↓ SIP/RTP
+Asterisk :5060
+  ↓
+内部短号 601 / 602 / ...
+  ↓
+Air780
+  ↓
+SIM / 手机网络
+```
+
+### SIP 配置
 
 ```yaml
 sip:
   enabled: true
   bind_host: "0.0.0.0"
   bind_port: 5062
-  username: "xiaoai"
-  password: "your-password"
-  caller_name: "小爱"
+  call_timeout_sec: 45
+
+  linphone:
+    username: "your-linphone-username"
+    password: "your-linphone-password"
+    caller_name: "小爱"
+
+  asterisk:
+    username: "xiaoai"
+    password: "your-asterisk-password"
+    caller_name: "小爱"
+
+  contacts:
+    我的手机:
+      via: "linphone"
+      uri: "sip:kotlin@sip.linphone.org"
+
+    张三:
+      via: "asterisk"
+      uri: "sip:601@192.168.200.128:5060"
+
+    李四:
+      via: "asterisk"
+      uri: "sip:602@192.168.200.128:5060"
 ```
 
-Asterisk 对应建立一个 `xiaoai` PJSIP endpoint，并在该 endpoint 的 context 中做分机路由：
+这里联系人表只保存“联系人名 → 路由类型 → SIP 目标”。**不要把张三的手机号码写进 chat-go**；对于 `via: asterisk`，手机号属于 Asterisk 的外拨规则/配置。
+
+### Asterisk 侧
+
+chat-go 使用 Asterisk 账户向 `5060/UDP` 发起 INVITE。Asterisk 为 chat-go 建立一个 PJSIP endpoint：
 
 ```ini
 [xiaoai-auth]
 type=auth
 auth_type=userpass
 username=xiaoai
-password=your-password
+password=your-asterisk-password
 
 [xiaoai-aor]
 type=aor
@@ -154,46 +209,31 @@ aors=xiaoai-aor
 identify_by=username,ip
 
 [from-xiaoai]
-exten => 601,1,Dial(PJSIP/air780,60)
-exten => 602,1,Dial(PJSIP/linphone-out,60)
+exten => 601,1,NoOp(张三 -> Air780)
+same => n,Dial(PJSIP/air780,60)
+
+exten => 602,1,NoOp(李四 -> Air780)
+same => n,Dial(PJSIP/air780,60)
 ```
 
-于是联系人可以配置成：
+`601`、`602` 只是 chat-go 和 Asterisk 之间的内部号码。具体“601 对应哪个手机号码、如何把号码交给 Air780 拨出”，放在 Asterisk/Air780 的下一层外拨逻辑中。
 
-```yaml
-contacts:
-  Air780: "sip:601@192.168.200.128:5060"
-  我的手机: "sip:602@192.168.200.128:5060"
+例如最终关系是：
+
+```text
+张三 → 601 → Asterisk → Air780 → 张三手机号
+李四 → 602 → Asterisk → Air780 → 李四手机号
+我的手机 → Linphone 官方 SIP
 ```
 
-这里 `601`、`602` 只是 Asterisk 内部分机号。Air780 真正要拨打外部手机号时，再由 Asterisk/Air780 的下一层拨号逻辑处理。
+### 说明
 
-示例：
+- chat-go 的 `server.port`（默认 4399/TCP）仍然是小爱 WebSocket。
+- chat-go 的 `sip.bind_port`（默认 5062/UDP）是 chat-go 自己的 SIP UA。
+- Asterisk 继续使用你现有的 `5060/UDP`。
+- Linphone 与 Asterisk 使用**不同的 SIP 账号配置**，因为它们是两条独立线路。
+- 路由选择只依赖本地联系人表，不使用 LLM。
 
-```yaml
-sip:
-  enabled: true
-  bind_host: "0.0.0.0"
-  bind_port: 5062
-  username: "xiaoai"
-  password: "your-password"
-  caller_name: "小爱"
-  call_timeout_sec: 45
-  call_keywords:
-    - "打电话"
-    - "拨电话"
-    - "拨打"
-    - "呼叫"
-    - "联系"
-  hangup_keywords:
-    - "挂断电话"
-    - "挂电话"
-    - "结束通话"
-    - "结束电话"
-  contacts:
-    客厅音响: "sip:livingroom@192.168.200.128"
-    Air780: "sip:air780@192.168.200.128:5060"
-```
 ## 配置说明
 
 | 配置项 | 说明 |
