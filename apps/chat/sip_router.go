@@ -7,6 +7,7 @@ import (
 )
 
 type SIPRoute struct {
+	Via     string
 	URI     string
 	Contact string
 }
@@ -64,17 +65,19 @@ func (r *SIPRouter) HandleInstruction(text string, abort func() error) bool {
 	}
 
 	bestContact := ""
+	bestVia := ""
 	bestURI := ""
-	for contact, uri := range cfg.Contacts {
+	for contact, route := range cfg.Contacts {
 		if strings.Contains(text, contact) && len([]rune(contact)) > len([]rune(bestContact)) {
 			bestContact = contact
-			bestURI = uri
+			bestVia = route.Via
+			bestURI = route.URI
 		}
 	}
 	if bestContact != "" {
-		contact, uri := bestContact, bestURI
+		contact, via, uri := bestContact, bestVia, bestURI
 		if r.onDial == nil {
-			log.Printf("⚠️ SIP 联系人已匹配但尚未配置 SIP UA: %s -> %s", contact, uri)
+			log.Printf("⚠️ SIP 联系人已匹配但尚未配置 SIP UA: %s -> %s -> %s", contact, via, uri)
 			return true
 		}
 
@@ -93,12 +96,12 @@ func (r *SIPRouter) HandleInstruction(text string, abort func() error) bool {
 		}
 
 		go func() {
-			if err := r.onDial(SIPRoute{URI: uri, Contact: contact}); err != nil {
+			if err := r.onDial(SIPRoute{Via: via, URI: uri, Contact: contact}); err != nil {
 				log.Printf("❌ SIP 拨号失败: %v", err)
 				r.EndCall()
 				return
 			}
-			log.Printf("☎️ SIP 拨号: %s -> %s", contact, uri)
+			log.Printf("☎️ SIP 拨号: %s -> %s -> %s", contact, via, uri)
 		}()
 		return true
 	}
