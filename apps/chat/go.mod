@@ -4,6 +4,8 @@ go 1.27
 
 require (
 	github.com/coder/websocket v1.8.15
+	github.com/emiago/diago v0.32.2
+	github.com/emiago/sipgo v1.4.3
 	github.com/cxjava/open-xiaoai/apps/client v0.0.0
 	github.com/cxjava/open-xiaoai/pkg/music v0.0.0
 	github.com/sashabaranov/go-openai v1.42.0
