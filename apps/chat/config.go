@@ -89,6 +89,9 @@ type SIPConfig struct {
 
 func defaultSIPConfig() SIPConfig {
 	return SIPConfig{
+		BindHost:       "0.0.0.0",
+		BindPort:       5062,
+		CallTimeoutSec: 45,
 		CallKeywords:   []string{"打电话", "拨电话", "拨打", "呼叫", "联系"},
 		HangupKeywords: []string{"挂断电话", "挂电话", "结束通话", "结束电话"},
 		Contacts:       map[string]string{},
