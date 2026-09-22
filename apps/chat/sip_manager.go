@@ -145,12 +145,16 @@ func (m *SIPManager) Dial(route SIPRoute) error {
 
 	var headers []sip.Header
 	if account.Username != "" {
+		fromHost := account.Domain
+		if fromHost == "" {
+			fromHost = normalizeBindHost(cfg.BindHost)
+		}
 		headers = append(headers, &sip.FromHeader{
 			DisplayName: account.CallerName,
 			Address: sip.Uri{
 				Scheme: "sip",
 				User:   account.Username,
-				Host:   normalizeBindHost(cfg.BindHost),
+				Host:   fromHost,
 			},
 			Params: sip.NewParams(),
 		})
