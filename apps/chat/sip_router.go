@@ -73,9 +73,6 @@ func (r *SIPRouter) HandleInstruction(text string, abort func() error) bool {
 	}
 	if bestContact != "" {
 		contact, uri := bestContact, bestURI
-		if err := abort(); err != nil {
-			log.Printf("⚠️ SIP 拨号前打断小爱失败: %v", err)
-		}
 		if r.onDial == nil {
 			log.Printf("⚠️ SIP 联系人已匹配但尚未配置 SIP UA: %s -> %s", contact, uri)
 			return true
@@ -86,10 +83,14 @@ func (r *SIPRouter) HandleInstruction(text string, abort func() error) bool {
 			r.mu.Unlock()
 			return true
 		}
-		// Reserve the route before starting the blocking SIP INVITE so a second
-		// ASR event cannot start another call while the first one is ringing.
+		// Mark the call active before AbortXiaoAI so a hangup ASR arriving while
+		// the native service is restarting can cancel the pending SIP dial.
 		r.active = true
 		r.mu.Unlock()
+
+		if err := abort(); err != nil {
+			log.Printf("⚠️ SIP 拨号前打断小爱失败: %v", err)
+		}
 
 		go func() {
 			if err := r.onDial(SIPRoute{URI: uri, Contact: contact}); err != nil {
