@@ -4,11 +4,13 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log"
 	"net"
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/emiago/diago"
@@ -27,6 +29,9 @@ type SIPManager struct {
 	ua        *sipgo.UserAgent
 	diago     *diago.Diago
 	call      *sipCall
+	dialing   bool
+	dialID    uint64
+	dialCancel context.CancelFunc
 	callEnded func()
 }
 
@@ -35,7 +40,10 @@ type sipCall struct {
 	dialog  *diago.DialogClientSession
 	media   *diago.DialogMedia
 
-	pcmWriter *diagoaudio.PCMEncoderWriter
+	reader      io.Reader
+	readerCodec media.Codec
+	writer      io.Writer
+	writerCodec media.Codec
 
 	downsampler pcmDownsampler
 	once        sync.Once
@@ -97,13 +105,6 @@ func (m *SIPManager) SetCallEnded(fn func()) {
 }
 
 func (m *SIPManager) Dial(route SIPRoute) error {
-	m.mu.Lock()
-	if m.call != nil {
-		m.mu.Unlock()
-		return fmt.Errorf("SIP call already active")
-	}
-	m.mu.Unlock()
-
 	target, transport, err := parseSIPURI(route.URI)
 	if err != nil {
 		return err
@@ -114,41 +115,57 @@ func (m *SIPManager) Dial(route SIPRoute) error {
 	if timeout <= 0 {
 		timeout = 45 * time.Second
 	}
+
 	ctx, cancel := context.WithTimeout(context.Background(), timeout)
 	defer cancel()
 
-	opts := diago.InviteOptions{
-		Username: cfg.Username,
-		Password: cfg.Password,
+	dialID := atomic.AddUint64(&m.dialID, 1)
+	m.mu.Lock()
+	if m.call != nil || m.dialing {
+		m.mu.Unlock()
+		return fmt.Errorf("SIP call is already active or dialing")
 	}
-	if cfg.Username != "" {
-		opts.OnResponse = func(res *sip.Response) error {
-			log.Printf("☎️ SIP %s -> %s", res.StatusCode, route.URI)
-			return nil
-		}
-	}
+	m.dialing = true
+	m.dialCancel = cancel
+	m.mu.Unlock()
 
-	clientOpts := diago.InviteOptions{
-		Username:  opts.Username,
-		Password:  opts.Password,
-		OnResponse: opts.OnResponse,
-	}
-	if cfg.Username != "" {
-		callerHost := cfg.BindHost
-		if callerHost == "" || callerHost == "0.0.0.0" || callerHost == "::" {
-			callerHost = "127.0.0.1"
+	defer func() {
+		m.mu.Lock()
+		if m.dialing && m.dialID == dialID {
+			m.dialing = false
+			m.dialCancel = nil
 		}
-		clientOpts.WithCaller(cfg.CallerName, cfg.Username, callerHost)
+		m.mu.Unlock()
+	}()
+
+	var headers []sip.Header
+	if cfg.Username != "" {
+		headers = append(headers, &sip.FromHeader{
+			DisplayName: cfg.CallerName,
+			Address: sip.Uri{
+				Scheme: "sip",
+				User:   cfg.Username,
+				Host:   normalizeBindHost(cfg.BindHost),
+			},
+			Params: sip.NewParams(),
+		})
 	}
 
 	dialog, med, err := m.diago.Invite(ctx, target, diago.InviteOptions{
 		Transport:  transport,
-		Username:   clientOpts.Username,
-		Password:   clientOpts.Password,
-		Headers:    clientOpts.Headers,
-		OnResponse: clientOpts.OnResponse,
+		Username:   cfg.Username,
+		Password:   cfg.Password,
+		Headers:    headers,
+		OnResponse: func(res *sip.Response) error {
+			log.Printf("☎️ SIP 响应: %d %s -> %s", res.StatusCode, route.URI, res.Reason)
+			return nil
+		},
 	})
 	if err != nil {
+		if !errors.Is(err, context.Canceled) && !errors.Is(err, context.DeadlineExceeded) {
+			log.Printf("❌ SIP INVITE %s failed: %v", route.URI, err)
+		}
+		m.notifyCallEnded()
 		return fmt.Errorf("SIP INVITE %s failed: %w", route.URI, err)
 	}
 
@@ -160,17 +177,24 @@ func (m *SIPManager) Dial(route SIPRoute) error {
 
 	if err := call.prepareMedia(); err != nil {
 		_ = call.end(true)
+		m.notifyCallEnded()
 		return fmt.Errorf("prepare SIP audio: %w", err)
 	}
 
 	m.mu.Lock()
-	if m.call != nil {
-		m.mu.Unlock()
-		_ = call.end(true)
-		return fmt.Errorf("SIP call already active")
+	cancelled := ctx.Err() != nil || !m.dialing || m.dialID != dialID
+	if !cancelled {
+		m.call = call
+		m.dialing = false
+		m.dialCancel = nil
 	}
-	m.call = call
 	m.mu.Unlock()
+
+	if cancelled {
+		_ = call.end(true)
+		m.notifyCallEnded()
+		return context.Canceled
+	}
 
 	if err := call.startClientAudio(); err != nil {
 		m.clearCall(call)
@@ -192,10 +216,16 @@ func (m *SIPManager) Dial(route SIPRoute) error {
 func (m *SIPManager) Hangup() error {
 	m.mu.Lock()
 	call := m.call
+	cancel := m.dialCancel
 	m.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
 	if call == nil {
 		return nil
 	}
+
 	err := call.end(true)
 	m.clearCall(call)
 	return err
@@ -213,9 +243,20 @@ func (m *SIPManager) WriteSpeakerPCM(data []byte) error {
 
 func (m *SIPManager) clearCall(call *sipCall) {
 	m.mu.Lock()
-	if m.call == call {
-		m.call = nil
+	if m.call != call {
+		m.mu.Unlock()
+		return
 	}
+	m.call = nil
+	cb := m.callEnded
+	m.mu.Unlock()
+	if cb != nil {
+		cb()
+	}
+}
+
+func (m *SIPManager) notifyCallEnded() {
+	m.mu.Lock()
 	cb := m.callEnded
 	m.mu.Unlock()
 	if cb != nil {
@@ -233,39 +274,31 @@ func (m *SIPManager) Close() error {
 
 func (c *sipCall) prepareMedia() error {
 	readerProps := diago.MediaProps{}
-	encodedReader, err := c.media.AudioReader(diago.WithAudioReaderMediaProps(&readerProps))
+	reader, err := c.media.AudioReader(diago.WithAudioReaderMediaProps(&readerProps))
 	if err != nil {
 		return err
 	}
 	if readerProps.Codec.Name != "PCMA" && readerProps.Codec.Name != "PCMU" {
-		return fmt.Errorf("unsupported negotiated codec: %s", readerProps.Codec.Name)
+		return fmt.Errorf("unsupported negotiated reader codec: %s", readerProps.Codec.Name)
 	}
 
 	writerProps := diago.MediaProps{}
-	encodedWriter, err := c.media.AudioWriter(diago.WithAudioWriterMediaProps(&writerProps))
+	writer, err := c.media.AudioWriter(diago.WithAudioWriterMediaProps(&writerProps))
 	if err != nil {
 		return err
 	}
 	if writerProps.Codec.Name != "PCMA" && writerProps.Codec.Name != "PCMU" {
-		return fmt.Errorf("unsupported negotiated codec: %s", writerProps.Codec.Name)
+		return fmt.Errorf("unsupported negotiated writer codec: %s", writerProps.Codec.Name)
 	}
 
-	decoder := &diagoaudio.PCMDecoderReader{}
-	if err := decoder.Init(readerProps.Codec, encodedReader); err != nil {
-		return err
-	}
-
-	encoder := &diagoaudio.PCMEncoderWriter{}
-	if err := encoder.Init(writerProps.Codec, encodedWriter); err != nil {
-		return err
-	}
-
-	c.pcmWriter = encoder
+	c.reader = reader
+	c.readerCodec = readerProps.Codec
+	c.writer = writer
+	c.writerCodec = writerProps.Codec
 
 	c.dialog.OnState(func(state sip.DialogState) {
 		log.Printf("☎️ SIP 状态: %s", state)
 	})
-
 	return nil
 }
 
@@ -283,7 +316,6 @@ func (c *sipCall) startClientAudio() error {
 	if err != nil {
 		return fmt.Errorf("start_play: %w", err)
 	}
-
 	if _, err := connect.GetRPC().CallRemote("start_recording", cfg, ptrUint64(5000)); err != nil {
 		_, _ = connect.GetRPC().CallRemote("stop_play", nil, ptrUint64(3000))
 		return fmt.Errorf("start_recording: %w", err)
@@ -297,40 +329,62 @@ func (c *sipCall) stopClientAudio() {
 }
 
 func (c *sipCall) writeSpeakerPCM(data []byte) error {
-	if c.pcmWriter == nil {
-		return fmt.Errorf("SIP PCM writer is not ready")
+	if c.writer == nil {
+		return fmt.Errorf("SIP audio writer is not ready")
 	}
 	pcm8 := c.downsampler.Down16To8(data)
 	if len(pcm8) == 0 {
 		return nil
 	}
-	_, err := c.pcmWriter.Write(pcm8)
+
+	g711buf := make([]byte, len(pcm8)/2)
+	switch c.writerCodec.Name {
+	case "PCMA":
+		if _, err := diagoaudio.EncodeAlawTo(g711buf, pcm8); err != nil {
+			return fmt.Errorf("PCMA encode: %w", err)
+		}
+	case "PCMU":
+		if _, err := diagoaudio.EncodeUlawTo(g711buf, pcm8); err != nil {
+			return fmt.Errorf("PCMU encode: %w", err)
+		}
+	default:
+		return fmt.Errorf("unsupported SIP writer codec: %s", c.writerCodec.Name)
+	}
+
+	_, err := c.writer.Write(g711buf)
 	return err
 }
 
 func (c *sipCall) forwardRemoteAudio() {
-	if c.media == nil {
+	if c.reader == nil {
 		return
 	}
 
-	readerProps := diago.MediaProps{}
-	encodedReader, err := c.media.AudioReader(diago.WithAudioReaderMediaProps(&readerProps))
-	if err != nil {
-		log.Printf("❌ SIP RTP reader: %v", err)
-		return
-	}
+	encoded := make([]byte, 160)
+	pcm8 := make([]byte, 320)
 
-	decoder := &diagoaudio.PCMDecoderReader{}
-	if err := decoder.Init(readerProps.Codec, encodedReader); err != nil {
-		log.Printf("❌ SIP PCM decoder: %v", err)
-		return
-	}
-
-	buf := make([]byte, 640)
 	for {
-		n, err := decoder.Read(buf)
+		n, err := c.reader.Read(encoded)
 		if n > 0 {
-			pcm16 := upsample8To16(buf[:n])
+			if n > len(encoded) {
+				n = len(encoded)
+			}
+			pcm8 = pcm8[:n*2]
+			var decodeErr error
+			switch c.readerCodec.Name {
+			case "PCMA":
+				_, decodeErr = diagoaudio.DecodeAlawTo(pcm8, encoded[:n])
+			case "PCMU":
+				_, decodeErr = diagoaudio.DecodeUlawTo(pcm8, encoded[:n])
+			default:
+				decodeErr = fmt.Errorf("unsupported SIP reader codec: %s", c.readerCodec.Name)
+			}
+			if decodeErr != nil {
+				log.Printf("❌ SIP G.711 decode: %v", decodeErr)
+				return
+			}
+
+			pcm16 := upsample8To16(pcm8)
 			if sendErr := connect.GetMessageManager().SendStream("play", pcm16, nil); sendErr != nil {
 				log.Printf("❌ 发送音频到小爱失败: %v", sendErr)
 				return
@@ -486,10 +540,10 @@ func parseSIPURI(raw string) (sip.Uri, string, error) {
 	}
 
 	uri := sip.Uri{
-		Scheme: scheme,
-		User:   user,
-		Host:   host,
-		Port:   port,
+		Scheme:    scheme,
+		User:      user,
+		Host:      host,
+		Port:      port,
 		UriParams: sip.NewParams(),
 		Headers:   sip.NewParams(),
 	}
