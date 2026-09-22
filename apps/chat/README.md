@@ -14,6 +14,7 @@
 - **中断机制**：新消息到来时自动取消正在进行的 AI 回复
 - **本地 SIP 路由（开发中）**：仅在 SIP 联系人匹配成功时接管电话指令；未匹配时保持小爱原生电话能力
 - **Web 管理页**：浏览器在线编辑 `config.yaml`，并发送文字到音箱测试 TTS
+- **本地 SIP 电话**：小爱原生最终 ASR 只在匹配“通话关键词 + SIP 联系人”时接管；服务器使用 Diago/SIPgo 发起 SIP，PCMA/PCMU RTP 与音箱 16 kHz PCM 双向转换
 
 ## 快速开始
 
@@ -99,6 +100,44 @@ http://你的IP:4399/admin
 
 `server.host` / `server.port`、`llm.*`、`proxy` 这类会影响监听地址或 LLM client 构造的配置，保存后会写入文件，但需要重启 `chat` 后完全生效。
 
+## 本地 SIP 电话
+
+启用后，音箱说：
+
+```text
+给客厅音响打电话
+```
+
+服务端会先匹配 `sip.call_keywords`，再匹配 `sip.contacts`。只有两者都命中才会调用 `AbortXiaoAI()` 并进入 SIP 呼叫；例如“给张三打电话”但 `张三` 不在 `sip.contacts` 时，不会打断小爱原生电话能力。
+
+SIP 媒体侧固定优先协商 PCMA/PCMU。音箱端保持现有 16 kHz / 16-bit / mono PCM，不在音箱上运行 SIP UA。
+
+示例：
+
+```yaml
+sip:
+  enabled: true
+  bind_host: "0.0.0.0"
+  bind_port: 5062
+  username: "xiaoai"
+  password: "your-password"
+  caller_name: "小爱"
+  call_timeout_sec: 45
+  call_keywords:
+    - "打电话"
+    - "拨电话"
+    - "拨打"
+    - "呼叫"
+    - "联系"
+  hangup_keywords:
+    - "挂断电话"
+    - "挂电话"
+    - "结束通话"
+    - "结束电话"
+  contacts:
+    客厅音响: "sip:livingroom@192.168.200.128"
+    Air780: "sip:air780@192.168.200.128:5060"
+```
 ## 配置说明
 
 | 配置项 | 说明 |
