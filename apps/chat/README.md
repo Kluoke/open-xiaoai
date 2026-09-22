@@ -12,6 +12,7 @@
 - **对话历史**：可配置的上下文长度
 - **自定义回复**：通过配置文件设置固定回复（文字/音频链接）
 - **中断机制**：新消息到来时自动取消正在进行的 AI 回复
+- **本地 SIP 路由（开发中）**：仅在 SIP 联系人匹配成功时接管电话指令；未匹配时保持小爱原生电话能力
 - **Web 管理页**：浏览器在线编辑 `config.yaml`，并发送文字到音箱测试 TTS
 
 ## 快速开始
@@ -116,6 +117,10 @@ http://你的IP:4399/admin
 | `greeting` | 连接成功后播放的提示语 |
 | `error_message` | 出错时的提示语 |
 | `custom_replies` | 固定回复规则（match + text/url） |
+| `sip.enabled` | 是否启用本地 SIP 路由 |
+| `sip.call_keywords` | 触发本地 SIP 拨号的关键词 |
+| `sip.hangup_keywords` | SIP 通话中的本地挂断关键词 |
+| `sip.contacts` | 本地联系人名称 → SIP URI；未匹配不会打断小爱 |
 
 认证配置示例：
 
