@@ -84,6 +84,7 @@ type SIPAccount struct {
 	Username   string `yaml:"username"`
 	Password   string `yaml:"password"`
 	CallerName string `yaml:"caller_name"`
+	Domain     string `yaml:"domain,omitempty"`
 }
 
 type SIPContact struct {
