@@ -151,7 +151,7 @@ func (m *SIPManager) Dial(route SIPRoute) error {
 		})
 	}
 
-	dialog, med, err := m.diago.Invite(ctx, target, diago.InviteOptions{
+	dialog, err := m.diago.Invite(ctx, target, diago.InviteOptions{
 		Transport:  transport,
 		Username:   cfg.Username,
 		Password:   cfg.Password,
@@ -172,7 +172,7 @@ func (m *SIPManager) Dial(route SIPRoute) error {
 	call := &sipCall{
 		manager: m,
 		dialog:  dialog,
-		media:   med,
+		media:   dialog.Media(),
 	}
 
 	if err := call.prepareMedia(); err != nil {
