@@ -158,6 +158,6 @@ func configRequiresRestart(oldConfig, newConfig *AppConfig) bool {
 		oldConfig.LLM != newConfig.LLM ||
 		oldConfig.SIP.BindHost != newConfig.SIP.BindHost ||
 		oldConfig.SIP.BindPort != newConfig.SIP.BindPort ||
-		oldConfig.SIP.Username != newConfig.SIP.Username ||
-		oldConfig.SIP.Password != newConfig.SIP.Password
+		oldConfig.SIP.Linphone != newConfig.SIP.Linphone ||
+		oldConfig.SIP.Asterisk != newConfig.SIP.Asterisk
 }
