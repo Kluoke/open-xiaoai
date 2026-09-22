@@ -51,13 +51,8 @@ func TestSIPRouterOnlyInterceptsConfiguredContact(t *testing.T) {
 		t.Fatal("matched SIP contact must be intercepted")
 	}
 
-	select {
-	case <-time.After(500 * time.Millisecond):
-		t.Fatal("SIP dial callback was not invoked")
-	default:
-	}
-
-	for i := 0; i < 100 && dialed.Load() == 0; i++ {
+	deadline := time.Now().Add(500 * time.Millisecond)
+	for dialed.Load() == 0 && time.Now().Before(deadline) {
 		time.Sleep(5 * time.Millisecond)
 	}
 	if dialed.Load() != 1 {
@@ -128,5 +123,27 @@ func TestParseSIPURI(t *testing.T) {
 	}
 	if transport != "udp" {
 		t.Fatalf("unexpected transport: %q", transport)
+	}
+}
+
+func TestSIPRouterDisabledPreservesNativeHandling(t *testing.T) {
+	cfg := testSIPConfig()
+	cfg.Enabled = false
+	var aborted atomic.Int32
+	r := NewSIPRouter(
+		func() SIPConfig { return cfg },
+		func(SIPRoute) error {
+			return errors.New("dial must not be called")
+		},
+		nil,
+	)
+	if handled := r.HandleInstruction("给客厅音响打电话", func() error {
+		aborted.Add(1)
+		return nil
+	}); handled {
+		t.Fatal("disabled SIP router must not intercept")
+	}
+	if aborted.Load() != 0 {
+		t.Fatal("disabled SIP router must not abort XiaoAI")
 	}
 }
