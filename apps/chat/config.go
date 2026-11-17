@@ -40,7 +40,9 @@ type LLMConfig struct {
 }
 
 type PromptConfig struct {
-	System string `yaml:"system"`
+	System     string `yaml:"system"`
+	InjectTime bool   `yaml:"inject_time"`
+	Timezone   string `yaml:"timezone"`
 }
 
 type ContextConfig struct {
@@ -149,6 +151,7 @@ func defaultConfig() *AppConfig {
 			BaseURL: "https://api.openai.com/v1",
 			Model:   "gpt-4.1-mini",
 		},
+		Prompt:  PromptConfig{InjectTime: true, Timezone: "Asia/Shanghai"},
 		Context: ContextConfig{HistoryMaxLength: 10},
 		Interrupt: InterruptConfig{
 			Keywords:     append([]string(nil), defaultInterruptKeywords...),
