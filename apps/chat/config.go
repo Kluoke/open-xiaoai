@@ -40,7 +40,9 @@ type LLMConfig struct {
 }
 
 type PromptConfig struct {
-	System string `yaml:"system"`
+	System     string `yaml:"system"`
+	InjectTime bool   `yaml:"inject_time"`
+	Timezone   string `yaml:"timezone"`
 }
 
 type ContextConfig struct {
@@ -62,6 +64,7 @@ type AppConfig struct {
 	Context        ContextConfig   `yaml:"context"`
 	Interrupt      InterruptConfig `yaml:"interrupt"`
 	CallAIKeywords []string        `yaml:"call_ai_keywords"`
+	SIP            SIPConfig       `yaml:"sip"`
 	CustomReplies  []CustomReply   `yaml:"custom_replies"`
 	Greeting       string          `yaml:"greeting"`
 	ErrorMessage   string          `yaml:"error_message"`
@@ -75,6 +78,55 @@ type AppConfig struct {
 }
 
 var defaultInterruptKeywords = []string{"闭嘴", "停止", "暂停", "停一下", "不要说了", "别说了"}
+
+// SIPConfig controls local SIP call routing. A call is intercepted only when
+// both a call keyword and a configured contact name are matched. If no contact
+// matches, the instruction is left untouched so XiaoAI can handle it natively.
+type SIPAccount struct {
+	Username   string `yaml:"username"`
+	Password   string `yaml:"password"`
+	CallerName string `yaml:"caller_name"`
+	Domain     string `yaml:"domain,omitempty"`
+}
+
+type SIPContact struct {
+	Via string `yaml:"via"` // linphone or asterisk
+	URI string `yaml:"uri"`
+}
+
+type SIPConfig struct {
+	Enabled        bool                 `yaml:"enabled"`
+	BindHost       string               `yaml:"bind_host"`
+	BindPort       int                  `yaml:"bind_port"`
+	CallTimeoutSec int                  `yaml:"call_timeout_sec"`
+	CallKeywords   []string             `yaml:"call_keywords"`
+	HangupKeywords []string             `yaml:"hangup_keywords"`
+	Linphone       SIPAccount           `yaml:"linphone"`
+	Asterisk       SIPAccount           `yaml:"asterisk"`
+	Contacts       map[string]SIPContact `yaml:"contacts"`
+}
+
+func (c SIPConfig) accountForRoute(via string) (SIPAccount, error) {
+	switch strings.ToLower(strings.TrimSpace(via)) {
+	case "linphone":
+		return c.Linphone, nil
+	case "asterisk":
+		return c.Asterisk, nil
+	default:
+		return SIPAccount{}, fmt.Errorf("unsupported SIP route %q; expected linphone or asterisk", via)
+	}
+}
+
+func defaultSIPConfig() SIPConfig {
+	return SIPConfig{
+		BindHost:       "0.0.0.0",
+		BindPort:       5062,
+		CallTimeoutSec: 45,
+		CallKeywords:   []string{"打电话", "拨电话", "拨打", "呼叫", "联系"},
+		HangupKeywords: []string{"挂断电话", "挂电话", "结束通话", "结束电话"},
+		Contacts:       map[string]SIPContact{},
+	}
+}
 
 type instructionDecision int
 
@@ -99,6 +151,7 @@ func defaultConfig() *AppConfig {
 			BaseURL: "https://api.openai.com/v1",
 			Model:   "gpt-4.1-mini",
 		},
+		Prompt:  PromptConfig{InjectTime: true, Timezone: "Asia/Shanghai"},
 		Context: ContextConfig{HistoryMaxLength: 10},
 		Interrupt: InterruptConfig{
 			Keywords:     append([]string(nil), defaultInterruptKeywords...),
@@ -106,6 +159,7 @@ func defaultConfig() *AppConfig {
 			KwsInterrupt: true,
 		},
 		CallAIKeywords: []string{"请", "你"},
+		SIP:            defaultSIPConfig(),
 		Greeting:       "已连接",
 		ErrorMessage:   "出错了，请稍后再试吧！",
 		ReplyPrefix:    "AI回复",

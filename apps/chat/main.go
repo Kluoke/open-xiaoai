@@ -25,6 +25,23 @@ func main() {
 	engine := NewEngine(cfg, speaker)
 	app := newAppRuntime(resolvedConfigPath, cfg, speaker, engine)
 
+	sipManager, err := NewSIPManager(func() SIPConfig {
+		return app.Config().SIP
+	})
+	if err != nil {
+		log.Fatalf("❌ SIP 模块启动失败: %v", err)
+	}
+	defer sipManager.Close()
+	app.SetSIPManager(sipManager)
+
+	sipRouter := NewSIPRouter(
+		func() SIPConfig { return app.Config().SIP },
+		sipManager.Dial,
+		sipManager.Hangup,
+	)
+	sipManager.SetCallEnded(sipRouter.EndCall)
+	engine.SetSIPRouter(sipRouter)
+
 	ctx := context.Background()
 	if err := app.StartInitialMusic(ctx); err != nil {
 		log.Fatalf("❌ 音乐模块启动失败: %v", err)
@@ -38,6 +55,9 @@ func main() {
 	log.Printf("   打断: keywords=%v match=%s kws=%v", cfg.Interrupt.Keywords, cfg.Interrupt.MatchMode, cfg.Interrupt.KwsInterrupt)
 	if cfg.Music.Enabled {
 		log.Printf("   音乐: 已启用")
+	}
+	if cfg.SIP.Enabled {
+		log.Printf("   SIP: 已启用 %s:%d", cfg.SIP.BindHost, cfg.SIP.BindPort)
 	}
 	log.Printf("   管理页: http://%s:%d/admin", cfg.Server.Host, cfg.Server.Port)
 

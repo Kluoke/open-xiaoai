@@ -24,8 +24,11 @@ curl -L -o /tmp/client.tar.gz \
 tar -xzf /tmp/client.tar.gz -C /data/open-xiaoai
 chmod +x /data/open-xiaoai/client
 
-# 运行（替换成你的 server 地址）
+# 运行（替换成你的 server 地址；默认保持 noop 采集行为）
 /data/open-xiaoai/client ws://你的server地址:4399
+
+# 可选：接管固件 speech.usock（需 root；运行时 bind mount /tmp 副本，不写固件）
+/data/open-xiaoai/client -capture-backend usock ws://你的server地址:4399
 
 # 多地址：按顺序尝试，支持 LAN + Tailscale 等场景（在家用 LAN，带回老家用 Tailscale）
 /data/open-xiaoai/client ws://192.168.1.100:4399 ws://my-server:4399
@@ -62,6 +65,19 @@ chmod +x /data/open-xiaoai/init.sh
 /data/open-xiaoai/init.sh ws://192.168.1.100:4399 ws://my-server:4399
 /data/open-xiaoai/init.sh -switch ws://你的IP:4399 ws://你的IP:4400
 ```
+
+`init.sh` 是一个 launcher（无参数 / 直接传地址 = `start`，行为兼容旧用法）：
+
+```sh
+init.sh start|daemon|stop|restart|status
+init.sh upgrade /path/to/new-client   # 自检 → 替换 → 重启，失败自动回滚到 client.bak
+```
+
+- 预检：二进制可执行、地址格式、server TCP 探活（有 `nc`/`wget` 时）；`OPEN_XIAOAI_STRICT=1` 时 server 不可达直接拒绝启动。
+- 单实例：用 `/tmp/xiaoai-client` 锁目录互斥，重复启动会明确报错。
+- 守护：client 退出 5 秒后自动拉起；连续 `OPEN_XIAOAI_MAX_CRASH`（默认 10）次快速崩溃后放弃并留日志。
+- `status` 输出 `running` / `degraded` / `stopped`，含 pid、server、uptime、restarts。
+- 日志在 `/tmp/xiaoai-client.log`（超过 1MB 自动截断），不写 `/data`。
 
 如果你想要开机自启动，下载 `boot.sh` 到 `/data/init.sh`，重启小爱音箱即可。`boot.sh` 会等待网络可用后，在后台执行 `/data/open-xiaoai/init.sh`。
 
@@ -171,5 +187,6 @@ ws://server地址:4399?u=alice&p=password123
 
 ## 注意事项
 
-- 当前仅支持 **小爱音箱 Pro（LX06）** 和 **Xiaomi 智能音箱 Pro（OH2P）**
+- `-capture-backend usock` 是显式 opt-in，默认仍为 `noop`。该模式仅适用于提供兼容 `/tmp/mico_aivs_lab/usock/speech.usock` 的固件，需 root 和运行时 `mount` / `umount` 权限。启动时会临时停止 `pns`、`mico_aivs_lab`，创建 PCM 运行时副本并接管 socket；成功后会 bind-mount 保护 socket，再恢复 TTS/网络服务。退出、注册失败或接管守护检测到 client/mount 异常时会尝试恢复原生 `pns` 与 `mico_aivs_lab`。
+- PCM 后端把固件通过 `speech.usock` 推送的 S16LE 流以 `record` tag 转发；原有 instruction 文本日志路径仍保留。当前仅支持 **小爱音箱 Pro（LX06）** 和 **Xiaomi 智能音箱 Pro（OH2P）**；其他机型/固件请先验证 `pns` 参数和 socket 协议。
 - 公网部署时请注意安全，默认提供执行任意脚本能力
